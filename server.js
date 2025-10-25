@@ -1,16 +1,16 @@
-// server.js — Precise chat + session memory + Amazon search links (no affiliateMap)
+// server.js — Chat + memory + Amazon search links (guarded)
 // - Remembers conversation per session (year/make/model, etc.)
-// - How-to answers (with safety) when asked
-// - Auto-builds Amazon search URLs with your affiliate tag
-// - Injects clickable search links directly in the main reply text
-// - Adds a small suggestion block with 2–3 search links
+// - Gives how-to steps when asked, then suggests parts
+// - Builds Amazon SEARCH links with your affiliate tag (no product DB needed)
+// - Injects clickable links ONLY when the query is truly product-like
+// - Adds a small "You might consider" block when appropriate
 
 import "dotenv/config";
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
 import OpenAI from "openai";
-import { extractIntent } from "./recommend.js"; // reuse your existing intent extractor
+import { extractIntent } from "./recommend.js";
 
 /* ---------------------------------------
    Express + CORS
@@ -103,7 +103,7 @@ function buildAmazonSearchURL(query, { tag, marketplace } = {}) {
 }
 
 /* ---------------------------------------
-   Tiny suggestion line (for the footer block)
+   Tiny suggestion line (footer block)
 ---------------------------------------- */
 function tinySearchLine(q) {
   const url = buildAmazonSearchURL(q);
@@ -173,43 +173,51 @@ function injectAffiliateLinks(replyText = "", products = []) {
 
 /* ---------------------------------------
    Build Amazon search queries from reply/message
+   (STRONGER FILTER: only return queries when we truly see products)
 ---------------------------------------- */
-function extractProductQueries({ userMsg, modelReply, vehicle, productType, max = 3 }) {
-  const q = [];
+const BRAND_WHITELIST = [
+  "BAKFlip","UnderCover","TruXedo","Extang","Retrax","Gator","Rough Country",
+  "Bilstein","DiabloSport","Hypertech","Motorcraft","Power Stop","WeatherTech",
+  "Tyger","Nitto","BFGoodrich","Falken","K&N","Borla","Flowmaster","Gator EFX",
+  "ArmorFlex","MX4","Ultra Flex","Lo Pro","Sentry CT","Solid Fold","Husky",
+  "FOX","Rancho","Monroe","Moog","ACDelco","Dorman","Bosch","NGK","Mopar"
+];
 
-  // 1) If we detected a productType, prefer vehicle-scoped queries
+// Shopping-ish nouns to gate generic queries
+const PRODUCT_TERMS = /(cover|tonneau|lift kit|leveling kit|tire|wheel|brake|pad|rotor|shock|strut|bumper|intake|exhaust|tuner|programmer|filter|floor mat|bed liner|rack|light|headlight|taillight|coilover|spring|winch|hitch|oil|battery)/i;
+
+function extractProductQueries({ userMsg, modelReply, vehicle, productType, max = 3 }) {
+  const out = [];
+
+  // 1) If we confidently detected a productType, build vehicle-scoped searches
   if (productType) {
     const veh = [vehicle?.year, vehicle?.make, vehicle?.model].filter(Boolean).join(" ");
-    if (veh) q.push(`${veh} ${productType}`);
-    q.push(`${productType} ${vehicle?.make || ""} ${vehicle?.model || ""}`.trim());
+    if (veh) out.push(`${veh} ${productType}`);
+    out.push(`${productType} ${vehicle?.make || ""} ${vehicle?.model || ""}`.trim());
   }
 
-  // 2) Pull brand+model phrases that often show up in truck accessories
-  const m = (modelReply || "").match(/\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z0-9\.\-]+){0,3})\b/g) || [];
-  const whitelist = [
-    "BAKFlip","UnderCover","TruXedo","Extang","Retrax","Gator","Rough Country",
-    "Bilstein","DiabloSport","Hypertech","Motorcraft","Power Stop","WeatherTech",
-    "Tyger","Nitto","BFGoodrich","Falken","K&N","Borla","Flowmaster","Gator EFX",
-    "ArmorFlex","MX4","Ultra Flex","Lo Pro","Sentry CT","Solid Fold"
-  ];
-  m.forEach(s => {
-    if (whitelist.some(w => s.toLowerCase().includes(w.toLowerCase()))) q.push(s);
+  // 2) Scan the model reply for brand phrases (only from whitelist)
+  const phrases = (modelReply || "").match(/\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z0-9\.\-]+){0,3})\b/g) || [];
+  phrases.forEach(s => {
+    if (BRAND_WHITELIST.some(w => s.toLowerCase().includes(w.toLowerCase()))) out.push(s);
   });
 
-  // 3) Fallback to the user message itself if nothing else
-  if (q.length === 0 && userMsg) q.push(userMsg);
+  // 3) DO NOT fall back to the raw user message unless it clearly looks like shopping
+  if (!out.length && userMsg && PRODUCT_TERMS.test(userMsg)) {
+    out.push(userMsg);
+  }
 
   // de-dup + trim + top-N
   const seen = new Set();
-  const out = [];
-  for (const s of q) {
+  const deduped = [];
+  for (const s of out) {
     const key = s.toLowerCase().trim();
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    out.push(s.trim());
-    if (out.length >= max) break;
+    deduped.push(s.trim());
+    if (deduped.length >= max) break;
   }
-  return out;
+  return deduped;
 }
 
 /* ---------------------------------------
@@ -303,7 +311,7 @@ You are "Trucks Helper" — a precise, friendly truck expert.
     }
     // Extend mappings as needed…
 
-    // 7) Build Amazon search queries from message + model reply
+    // 7) Build Amazon search queries from message + model reply (STRICT FILTER)
     const queries = extractProductQueries({
       userMsg: message,
       modelReply: reply,
@@ -312,14 +320,15 @@ You are "Trucks Helper" — a precise, friendly truck expert.
       max: 3
     });
 
-    // 8) Inline-link product phrases in the MAIN TEXT to Amazon search (with your tag)
-    reply = injectAffiliateLinks(
-      reply,
-      queries.map(q => ({ name: q, url: buildAmazonSearchURL(q) }))
-    );
-
-    // 9) Append a small suggestion block if we have queries
+    // 8) ONLY link when we actually found product-like queries
     if (queries.length) {
+      // Inline hyperlinks in MAIN TEXT to Amazon search with tag
+      reply = injectAffiliateLinks(
+        reply,
+        queries.map(q => ({ name: q, url: buildAmazonSearchURL(q) }))
+      );
+
+      // 9) Append a small suggestion block
       const lines = queries.map(tinySearchLine);
       reply = `${reply}
 
@@ -327,6 +336,7 @@ You might consider:
 ${lines.join("\n")}
 As an Amazon Associate, we may earn from qualifying purchases.`;
     }
+    // else: do nothing — informational answers won't get any links
 
     // 10) Save and return
     pushHistory(sess, "assistant", reply);
@@ -341,4 +351,4 @@ As an Amazon Associate, we may earn from qualifying purchases.`;
 });
 
 /* --------------------------------------- */
-app.listen(PORT, () => console.log(`🚀 Truckbot running (chat + memory + Amazon search links) on :${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Truckbot running (chat + memory + guarded Amazon links) on :${PORT}`));
