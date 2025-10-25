@@ -1,37 +1,53 @@
-import 'dotenv/config';
-import express from 'express';
-import bodyParser from 'body-parser';
-import cors from 'cors';
-import OpenAI from 'openai';
-import fs from 'fs';
+import "dotenv/config";
+import express from "express";
+import bodyParser from "body-parser";
+import cors from "cors";
+import OpenAI from "openai";
+import { getBestAffiliateLinks, extractIntent } from "./recommend.js";
 
 const app = express();
 app.use(bodyParser.json());
-app.use(cors({ origin: ['https://trucksenthusiasts.com'] })); // lock to your domain
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const affiliateMap = JSON.parse(fs.readFileSync('./affiliateMap.json','utf8'));
 
-function findAffiliate({ query, asin, sku }) {
-  const q = (query||'').toLowerCase();
-  let row = affiliateMap.find(r => (asin && r.asin===asin) || (sku && r.sku===sku));
-  if (!row) row = affiliateMap.find(r =>
-    r.asin===asin || r.sku===sku || r.name.toLowerCase().includes(q) || (r.tags||[]).some(t=>q.includes(t))
-  );
-  return row ? { url: row.url, asin: row.asin, name: row.name } : { url: null };
-}
+// CORS
+const allowed = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      const ok = !origin || allowed.length === 0 || allowed.includes(origin);
+      cb(null, ok);
+    },
+  })
+);
+
+// OpenAI
+const apiKey = process.env.OPENAI_API_KEY;
+if (!apiKey) console.warn("[warn] OPENAI_API_KEY not set — /chat calls will fail.");
+const client = new OpenAI({ apiKey });
+const MODEL = process.env.MODEL || "gpt-5";
+const PORT = process.env.PORT || 3000;
+
+// ---- Tool definition ----
 const tools = [
   {
     type: "function",
     function: {
-      name: "get_affiliate_link",
-      description: "Return an affiliate URL for a product by name/asin/sku. If not found, return null.",
+      name: "get_affiliate_links",
+      description:
+        "Return up to 3 affiliate URLs best-matching the user's intent (vehicle/type/brand/asin). If nothing matches, return an empty list.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string" },
-          asin: { type: "string", nullable: true },
-          sku: { type: "string", nullable: true }
+          query:   { type: "string", description: "User's raw question or keywords" },
+          asin:    { type: "string", nullable: true },
+          sku:     { type: "string", nullable: true },
+          vehicle: { type: "string", nullable: true },
+          type:    { type: "string", nullable: true },
+          brand:   { type: "string", nullable: true },
+          limit:   { type: "number",  nullable: true, default: 3 }
         },
         required: ["query"]
       }
@@ -39,47 +55,83 @@ const tools = [
   }
 ];
 
-app.post('/chat', async (req, res) => {
-  const { message, session } = req.body;
+function callAffiliateTool(args) {
+  const list = getBestAffiliateLinks(args || {});
+  return JSON.stringify({ results: list });
+}
 
-  const system = `
-You are "Trucks Helper", an expert on pickup trucks, lift kits, tires, wheels, tonneau covers, towing, fitment.
-- When you recommend a specific product, try the get_affiliate_link tool first.
-- If a link exists, include a short CTA and the link.
-- Include this once per session at the end if not already shown: "As an Amazon Associate, we may earn from qualifying purchases."
-- Ask for fitment essentials when needed (year, bed length, trim).
-- Be safety-focused; refuse illegal/unsafe advice and suggest safer alternatives.
+// Health
+app.get("/health", (_req, res) => res.send("ok"));
+
+// Chat
+app.post("/chat", async (req, res) => {
+  try {
+    const { message, session } = req.body || {};
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ reply: "Missing 'message' (string) in body." });
+    }
+
+    const userName = (session || "visitor").toString().slice(0, 12);
+
+    const systemPrompt = `
+You are "Trucks Helper", a friendly, expert assistant for pickup trucks (fitment, lift kits, tires, wheels, tonneau covers, towing).
+Policy:
+- When recommending any specific product, CALL the 'get_affiliate_links' tool with the user's full question (and any inferred vehicle/type/brand).
+- If the tool returns no results, ask ONE fitment question (year, bed length, trim) and try again.
+- Prefer giving up to three picks with brand, type, and a short reason + CTA link.
+- Be concise, practical, and safety-forward (no illegal or unsafe advice).
+- Show this disclosure once per session: "As an Amazon Associate, we may earn from qualifying purchases."
 `;
 
-  let msgs = [
-    { role: "system", content: system },
-    { role: "user", content: message, name: session?.slice(0,12) || "visitor" }
-  ];
+    const baseMessages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: message, name: userName }
+    ];
 
-  // 1st pass (tool auto)
-  let r = await openai.chat.completions.create({
-    model: "gpt-5",
-    messages: msgs,
-    tools,
-    tool_choice: "auto",
-    temperature: 0.3
-  });
+    // First pass
+    let r = await client.chat.completions.create({
+      model: MODEL,
+      messages: baseMessages,
+      tools,
+      tool_choice: "auto",
+      temperature: 0.3
+    });
 
-  const ch = r.choices[0].message;
-  if (ch.tool_calls?.length) {
-    const call = ch.tool_calls[0];
-    const args = JSON.parse(call.function.arguments || "{}");
-    const result = findAffiliate(args);
+    let msg = r?.choices?.[0]?.message;
 
-    msgs.push(ch);
-    msgs.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result) });
+    // If tool is called, fulfill and do second pass
+    if (msg?.tool_calls?.length) {
+      const call = msg.tool_calls[0];
+      const args = JSON.parse(call.function.arguments || "{}");
+      const inferred = extractIntent(args.query || message || "");
+      const mergedArgs = { limit: 3, ...inferred, ...args };
+      const toolContent = callAffiliateTool(mergedArgs);
 
-    r = await openai.chat.completions.create({ model: "gpt-5", messages: msgs, temperature: 0.3 });
+      const followup = [
+        ...baseMessages,
+        msg,
+        {
+          role: "tool",
+          tool_call_id: call.id,
+          name: call.function.name,
+          content: toolContent
+        }
+      ];
+
+      r = await client.chat.completions.create({
+        model: MODEL,
+        messages: followup,
+        temperature: 0.3
+      });
+
+      msg = r?.choices?.[0]?.message;
+    }
+
+    res.json({ reply: (msg?.content || "").replace(/\n\n/g, "<br><br>") });
+  } catch (e) {
+    console.error("[/chat] error:", e);
+    res.status(500).json({ reply: "Sorry, something went wrong generating the answer." });
   }
-
-  res.json({ reply: r.choices[0].message.content });
 });
 
-app.get('/health', (_req,res)=>res.send('ok'));
-app.listen(3000, ()=>console.log('Truckbot on :3000'));
-// See chat for full version
+app.listen(PORT, () => console.log(`Truckbot running on :${PORT}`));
