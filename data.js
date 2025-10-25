@@ -17,12 +17,14 @@ function safeLoad(path, fallback) {
 }
 
 /**
- * Loads all data JSON files
+ * Loads all data JSON files.
  * These files contain affiliate products and pre-computed top picks.
+ * Make sure both files exist in the /data folder at the root of your repo.
  */
 export const affiliateMap = safeLoad("./data/affiliateMap_enriched.json", []);
 export const topPicksIndex = safeLoad("./data/top_picks_index.json", {});
 
-console.log(`[data.js] Loaded ${affiliateMap.length} affiliate entries`);
-console.log(`[data.js] Loaded top picks for ${Object.keys(topPicksIndex).length} vehicles`);
-// See chat for full version
+console.log(`[data.js] ✅ Loaded ${affiliateMap.length} affiliate entries`);
+console.log(
+  `[data.js] ✅ Loaded top picks for ${Object.keys(topPicksIndex).length} vehicles`
+);
