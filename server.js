@@ -1,8 +1,9 @@
-// server.js — Precise, session-aware bot + inline affiliate hyperlinks in main text
+// server.js — Precise chat + session memory + inline affiliate hyperlinks
 // - Remembers conversation per session (year/make/model, etc.)
-// - Gives task-focused answers (how-to when asked) with safety notes
-// - Finds vehicle-specific products and appends tiny "View on Amazon" lines
-// - NEW: Injects affiliate hyperlinks directly into the assistant's main text
+// - How-to answers (with safety) when asked
+// - Vehicle-targeted product picks (Amazon only)
+// - Injects clickable affiliate hyperlinks directly in the main reply text
+// - Adds a small suggestion block when a product type is detected
 
 import "dotenv/config";
 import express from "express";
@@ -14,7 +15,7 @@ import path from "path";
 import { extractIntent, getBestAffiliateLinks } from "./recommend.js";
 
 /* ---------------------------------------
-   Load affiliate data (root or /data)
+   Load affiliate data (supports root or /data)
 ---------------------------------------- */
 function safeLoadJSON(p, fallback = []) {
   try { return JSON.parse(fs.readFileSync(p, "utf8")); }
@@ -50,7 +51,7 @@ const PORT   = process.env.PORT || 3000;
 
 /* ---------------------------------------
    In-memory session store (simple)
-   - For production HA, swap to Redis
+   - Swap to Redis if you need persistence across restarts
 ---------------------------------------- */
 const SESSIONS = new Map(); // sessionId -> { history: Message[], vehicle: {...} }
 const MAX_TURNS = 12;
@@ -69,7 +70,7 @@ function pushHistory(sess, role, content) {
 }
 
 /* ---------------------------------------
-   Utilities for precise recommendations
+   Utilities: intent, vehicle memory, product-type detection
 ---------------------------------------- */
 const HOWTO_KEYWORDS = [
   "how to", "how do i", "procedure", "steps", "install", "replace", "change", "fix", "tutorial"
@@ -100,7 +101,7 @@ function missingFitment(vehicle) {
 }
 
 /* ---------------------------------------
-   Tiny link line (for the suggestion block)
+   Tiny suggestion line
 ---------------------------------------- */
 function tinyLinkLine(name, url, ownerNote = "owners like the fit and performance") {
   const safe = name || "View on Amazon";
@@ -108,34 +109,67 @@ function tinyLinkLine(name, url, ownerNote = "owners like the fit and performanc
   return `• ${safe} — ${ownerNote}. 👉 <a href="${link}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
-/* ---------------------------------------
-   NEW: Inject inline affiliate hyperlinks
-   - Wraps product names inside the assistant's MAIN TEXT with <a href="...">
-   - Uses exact-name matching (case-insensitive), safe-escaped
----------------------------------------- */
-function injectAffiliateLinks(replyText, products) {
+/* ========= Inline link helpers (fuzzy + markdown strip) ========= */
+
+// Basic markdown stripper so your UI sees clean text (no **bold** etc.)
+function stripMarkdownBasic(s = "") {
+  return s
+    .replace(/(\*{1,3})([^*]+)\1/g, "$2")      // **bold**, *italic*, ***both***
+    .replace(/`([^`]+)`/g, "$1")               // `code`
+    .replace(/^#+\s*(.+)$/gm, "$1")            // # headings
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, "")      // remove images
+    .replace(/\[[^\]]+\]\([^)]+\)/g, "$&");    // keep markdown links as-is
+}
+
+// Token utilities for fuzzy matching
+const _STOP = new Set(["the","a","an","for","to","of","on","with","and","or","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great"]);
+const _norm = s => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+const _toks = s => _norm(s).split(" ").filter(t => t && !_STOP.has(t));
+
+// Build regex matching main tokens in order (like "bakflip mx4")
+function buildOrderedTokenRegex(name) {
+  const ts = _toks(name);
+  if (!ts.length) return null;
+  const chosen = ts.slice(0, Math.min(3, ts.length)); // 2–3 core tokens
+  const pattern = chosen.map(t => `(${t})`).join(`\\s+`);
+  return new RegExp(`\\b${pattern}\\b`, "gi");
+}
+
+/**
+ * Inject affiliate hyperlinks directly into the reply text.
+ * - Fuzzy matches brand+model tokens
+ * - Works even if AI writes small spelling differences
+ */
+function injectAffiliateLinks(replyText = "", products = []) {
   if (!replyText || !Array.isArray(products) || !products.length) return replyText;
 
-  let result = replyText;
+  let out = stripMarkdownBasic(replyText);
+
   for (const p of products) {
-    if (!p?.url) continue;
-    const name = p.name || `${p.brand || ""} ${p.type || ""}`.trim();
-    if (!name) continue;
+    const url = p?.url;
+    const full = p?.name || `${p?.brand || ""} ${p?.type || ""}`.trim();
+    if (!url || !full) continue;
 
-    // Escape special regex chars in the product name
-    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    // Word-boundary match, case-insensitive
-    const regex = new RegExp(`\\b(${escaped})\\b`, "gi");
+    // 1) token-ordered fuzzy match (brand + model)
+    const tokenRe = buildOrderedTokenRegex(full);
+    if (tokenRe && tokenRe.test(out)) {
+      out = out.replace(tokenRe, (m) =>
+        `<a href="${url}" target="_blank" rel="nofollow sponsored noopener">${m}</a>`
+      );
+      continue;
+    }
 
-    // Replace occurrences with a hyperlink (preserve original case via $1)
-    if (regex.test(result)) {
-      result = result.replace(
-        regex,
-        `<a href="${p.url}" target="_blank" rel="nofollow sponsored noopener">$1</a>`
+    // 2) fallback: exact full-name (case-insensitive), word-bounded
+    const escaped = full.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const exactRe = new RegExp(`\\b(${escaped})\\b`, "gi");
+    if (exactRe.test(out)) {
+      out = out.replace(
+        exactRe,
+        `<a href="${url}" target="_blank" rel="nofollow sponsored noopener">$1</a>`
       );
     }
   }
-  return result;
+  return out;
 }
 
 /* ---------------------------------------
@@ -147,6 +181,11 @@ app.get("/diag", (_req,res)=>res.json({
   affiliate_entries: affiliateMap.length, allowed_origins: allowed,
   sessions: SESSIONS.size
 }));
+
+// Quick UI test: if this isn't clickable in your chat, switch to innerHTML in the widget
+app.get("/debug/anchor", (_req,res) => {
+  res.send('Test anchor → <a href="https://amazon.com" target="_blank" rel="nofollow">Amazon</a>');
+});
 
 /* ---------------------------------------
    Chat endpoint
@@ -202,7 +241,7 @@ You are "Trucks Helper" — a precise, friendly truck expert.
     let reply = r?.choices?.[0]?.message?.content
       || "I couldn't find a clear answer. Tell me your truck year, make and model.";
 
-    // 6) Figure out the product type requested (to fetch targeted picks)
+    // 6) Product-type routing for targeted picks
     let productType = null;
     const m = message.toLowerCase();
     if (isHowTo && /brake|pad|rotor/.test(m)) {
@@ -237,9 +276,8 @@ You are "Trucks Helper" — a precise, friendly truck expert.
       }
     }
 
-    // 8) Inject affiliate hyperlinks directly in the MAIN TEXT (for any known product names)
-    //    Use the subset of Amazon picks (if we have them) to prioritize relevant names;
-    //    fall back to all affiliateMap to catch other names the model mentioned.
+    // 8) Inject affiliate hyperlinks directly in the MAIN TEXT
+    //    Prefer the targeted 'amazonOnly' list if present; else fall back to full dataset
     if (amazonOnly.length) {
       reply = injectAffiliateLinks(reply, amazonOnly);
     } else {
