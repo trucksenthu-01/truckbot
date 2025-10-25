@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 
 /* -----------------------------
-   Load affiliate data
+   Load Affiliate Data
 ------------------------------ */
 let affiliateMap = [];
 try {
@@ -45,27 +45,23 @@ const MODEL = process.env.MODEL || "gpt-4o-mini";
 const PORT = process.env.PORT || 3000;
 
 /* -----------------------------
-   Health Check
+   Helper: Build image link from ASIN
 ------------------------------ */
-app.get("/health", (_, res) => res.send("ok"));
-app.get("/diag", (_, res) =>
-  res.json({
-    ok: true,
-    model: MODEL,
-    affiliate_entries: affiliateMap.length,
-    allowed_origins: allowed,
-    has_api_key: !!apiKey,
-  })
-);
+function amazonImageFromASIN(asin, marketplace = "US") {
+  if (!asin) return null;
+  return `https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN=${asin}&Format=_SL400_&ID=AsinImage&MarketPlace=${marketplace}&ServiceVersion=20070822`;
+}
 
 /* -----------------------------
-   Affiliate Injector
+   Affiliate Injector with Images
 ------------------------------ */
-function injectAffiliateLinks(replyText = "") {
+function injectAffiliateContent(replyText = "") {
   if (!replyText || !affiliateMap.length) return replyText;
 
   let reply = replyText;
   const lower = reply.toLowerCase();
+
+  // Find matching products
   const found = affiliateMap
     .filter(
       item =>
@@ -75,12 +71,34 @@ function injectAffiliateLinks(replyText = "") {
     .slice(0, 3);
 
   if (found.length) {
-    const lines = found.map(
-      p =>
-        `👉 [${p.name || p.brand} – View on Amazon](${p.url})`
-    );
-    reply +=
-      `\n\n💡 You might like these:\n${lines.join("\n")}\n\n_As an Amazon Associate, we may earn from qualifying purchases._`;
+    const cards = found.map(p => {
+      const img = p.asin ? amazonImageFromASIN(p.asin) : null;
+      const safeName = p.name || p.brand;
+      const safeLink = p.url;
+
+      return `
+        <div style="border:1px solid #233244;border-radius:12px;padding:12px;margin:8px 0;
+                    background:#0f1620;color:#fff;max-width:480px;">
+          <div style="font-weight:600;margin-bottom:6px;">${safeName}</div>
+          ${img ? `<img src="${img}" alt="${safeName}" width="320" loading="lazy"
+                     style="border-radius:10px;margin-bottom:8px;display:block;">` : ""}
+          <a href="${safeLink}" target="_blank" rel="nofollow sponsored noopener"
+             style="display:inline-block;padding:8px 12px;border-radius:10px;
+                    background:#1f6feb;color:#fff;text-decoration:none;">
+            👉 View on Amazon
+          </a>
+        </div>
+      `;
+    });
+
+    reply += `
+      <br><br>
+      <div style="font-weight:600;margin-top:12px;">💡 You might like these:</div>
+      ${cards.join("")}
+      <p style="font-size:12px;opacity:.75;margin-top:8px;">
+        As an Amazon Associate, we may earn from qualifying purchases.
+      </p>
+    `;
   }
 
   return reply;
@@ -96,12 +114,12 @@ app.post("/chat", async (req, res) => {
 
     console.log(`[chat] Message: ${message}`);
 
-    // ChatGPT-style system prompt
     const systemPrompt = `
-You are "Trucks Helper" — a friendly, knowledgeable truck expert like ChatGPT.
-You can answer any truck-related question (lift kits, tonneau covers, tires, towing, etc.).
-Be natural, concise, and friendly.
-Whenever you mention a product brand or accessory, the system will add affiliate links automatically.
+You are "Trucks Helper" — a friendly, knowledgeable truck expert chatbot like ChatGPT.
+You can answer any truck-related question: lift kits, tonneau covers, tires, towing, etc.
+Be natural, conversational, and concise — sound human.
+Write in Markdown style for bold text and line breaks.
+Avoid giving Amazon links yourself — they’ll be added automatically.
 `;
 
     // Generate ChatGPT-style answer
@@ -115,9 +133,10 @@ Whenever you mention a product brand or accessory, the system will add affiliate
     });
 
     let reply = r?.choices?.[0]?.message?.content || "Sorry, I couldn’t come up with an answer right now.";
-    reply = injectAffiliateLinks(reply);
 
-    // Respond
+    // Inject affiliate links + images
+    reply = injectAffiliateContent(reply);
+
     res.json({ reply });
   } catch (err) {
     console.error("[/chat] error", err);
@@ -131,4 +150,4 @@ Whenever you mention a product brand or accessory, the system will add affiliate
 /* -----------------------------
    Start Server
 ------------------------------ */
-app.listen(PORT, () => console.log(`🚀 Truckbot running like ChatGPT on :${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Truckbot running with images on :${PORT}`));
