@@ -1,4 +1,4 @@
-// server.js — ChatGPT-style replies + small inline Amazon links (no cards)
+// server.js — Precise, session-aware bot with tailored how-to + vehicle-specific product links
 
 import "dotenv/config";
 import express from "express";
@@ -45,127 +45,189 @@ const MODEL  = process.env.MODEL || "gpt-4o-mini";
 const PORT   = process.env.PORT || 3000;
 
 /* ---------------------------------------
-   Diagnostics
+   In-memory session store (simple & fast)
+   - For production, swap to Redis for persistence
 ---------------------------------------- */
-app.get("/health", (_req, res) => res.send("ok"));
-app.get("/diag", (_req, res) => res.json({
-  ok: true,
-  model: MODEL,
-  has_api_key: !!process.env.OPENAI_API_KEY,
-  affiliate_entries: affiliateMap.length,
-  allowed_origins: allowed
-}));
+const SESSIONS = new Map(); // sessionId -> { history: Message[], vehicle: {...} }
+const MAX_TURNS = 12;
 
-/* ---------------------------------------
-   Helper utils (fuzzy matching + links)
----------------------------------------- */
-const STOP = new Set([
-  "the","a","an","for","to","of","on","with","and","or","cover","covers",
-  "tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great"
-]);
-const norm = s => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-const toks = s => norm(s).split(" ").filter(t => t && !STOP.has(t));
-const jac  = (A,B) => {
-  const a = new Set(toks(A)), b = new Set(toks(B));
-  const inter = [...a].filter(x => b.has(x)).length;
-  const uni = new Set([...a, ...b]).size || 1;
-  return inter / uni;
-};
-const isAmazonLink = (url="") => /(^https?:\/\/(www\.)?(amzn\.to|amazon\.[a-z.]+)\/)/i.test(url);
-
-/** Pick up to N relevant Amazon items (prefer ASIN & strong fuzzy score). */
-function pickAmazonProducts(userMsg, modelReply, max = 3) {
-  const scored = affiliateMap
-    .filter(p => isAmazonLink(p.url))
-    .map(p => {
-      const name = [p.brand || "", p.name || ""].join(" ").trim();
-      const score = 0.6*jac(modelReply, name) + 0.4*jac(userMsg, name) + (p.asin ? 0.06 : 0);
-      return { p, score };
-    })
-    .filter(x => x.score > 0.10) // loose threshold
-    .sort((a,b) => b.score - a.score);
-
-  // de-dupe by ASIN or URL
-  const out = [];
-  const seen = new Set();
-  for (const {p} of scored) {
-    const key = p.asin || p.url;
-    if (!seen.has(key)) { out.push(p); seen.add(key); }
-    if (out.length >= max) break;
+function getSession(sessionId) {
+  if (!SESSIONS.has(sessionId)) {
+    SESSIONS.set(sessionId, { history: [], vehicle: {} });
   }
-  return out;
+  return SESSIONS.get(sessionId);
+}
+function pushHistory(sess, role, content) {
+  sess.history.push({ role, content });
+  if (sess.history.length > MAX_TURNS) {
+    sess.history.splice(0, sess.history.length - MAX_TURNS);
+  }
 }
 
-/** Append small inline links (no cards). Falls back to recommender if needed. */
-function appendInlineAmazonLinks(userMsg, replyText) {
-  let picks = pickAmazonProducts(userMsg, replyText, 3);
+/* ---------------------------------------
+   Utilities for precise recommendations
+---------------------------------------- */
+const HOWTO_KEYWORDS = [
+  "how to", "how do i", "procedure", "steps", "install", "replace", "change", "fix", "tutorial"
+];
 
-  // Fallback to recommender using the user's intent if fuzzy match finds nothing
-  if (!picks.length) {
-    const intent = extractIntent(userMsg || "");
-    picks = getBestAffiliateLinks({ ...intent, query: userMsg, limit: 3 }) || [];
-    picks = (picks || []).filter(p => isAmazonLink(p.url)).slice(0, 3);
-  }
+function looksLikeHowTo(text="") {
+  const t = text.toLowerCase();
+  return HOWTO_KEYWORDS.some(k => t.includes(k));
+}
 
-  if (!picks.length) return replyText;
+function mergeVehicleMemory(sess, fromIntent = {}) {
+  const v = sess.vehicle || {};
+  const merged = {
+    year:   fromIntent.year   || v.year   || null,
+    make:   fromIntent.make   || v.make   || null,
+    model:  fromIntent.model  || v.model  || null,
+    bed:    fromIntent.bed    || v.bed    || null,
+    trim:   fromIntent.trim   || v.trim   || null,
+    engine: fromIntent.engine || v.engine || null,
+  };
+  sess.vehicle = merged;
+  return merged;
+}
 
-  const lines = picks.map(p => {
-    const title = p.name || `${p.brand || ""} ${p.type || ""}`.trim();
-    // Keep it human & review-aware in one line, with a tiny link at the end
-    return `• ${title} — owners like the fit and weather protection. 👉 <a href="${p.url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
-  });
+function missingFitment(vehicle) {
+  const missing = [];
+  if (!vehicle.year)  missing.push("year");
+  if (!vehicle.make)  missing.push("make");
+  if (!vehicle.model) missing.push("model");
+  // bed/trim are optional, but we’ll ask if relevant
+  return missing;
+}
 
-  return `${replyText}
+function buildToolQuery(userMessage, sessVehicle, extra = {}) {
+  const base = extractIntent(userMessage || "");
+  const vehicle = mergeVehicleMemory({ vehicle: sessVehicle }, base); // non-mutating copy
+  return { ...base, ...extra, vehicle: `${vehicle.year||""} ${vehicle.make||""} ${vehicle.model||""}`.trim() };
+}
+
+/* ---------------------------------------
+   HTML line helper for tiny links
+---------------------------------------- */
+function tinyLinkLine(name, url, ownerNote = "owners like the fit and performance") {
+  const safe = name || "View on Amazon";
+  const link = url || "#";
+  return `• ${safe} — ${ownerNote}. 👉 <a href="${link}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
+}
+
+/* ---------------------------------------
+   Endpoints
+---------------------------------------- */
+app.get("/health", (_req,res)=>res.send("ok"));
+app.get("/diag", (_req,res)=>res.json({
+  ok:true, model: MODEL, has_api_key: !!process.env.OPENAI_API_KEY,
+  affiliate_entries: affiliateMap.length, allowed_origins: allowed,
+  sessions: SESSIONS.size
+}));
+
+app.post("/chat", async (req, res) => {
+  try {
+    const { message, session } = req.body || {};
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ reply: "Missing 'message' (string) in body." });
+    }
+    const sessionId = (session || "visitor").toString().slice(0, 60);
+    const sess = getSession(sessionId);
+
+    // 1) Update memory with the user's message
+    pushHistory(sess, "user", message);
+
+    // 2) Extract/update vehicle profile from this turn
+    const parsed = extractIntent(message || "");
+    const vehicle = mergeVehicleMemory(sess, parsed);
+
+    // 3) If critical fitment is missing and user is asking for products, ask once.
+    const miss = missingFitment(vehicle);
+    const wantsProducts = /cover|lift|tire|wheel|brake|pad|rotor|shock|bumper|intake|exhaust|light|rack|liner/i.test(message);
+    if (wantsProducts && miss.length >= 2) {
+      const ask = `To recommend exact parts, what is your truck's ${miss.join(" & ")}? (Example: 2019 Ford F-150 5.5 ft bed XLT)`;
+      pushHistory(sess, "assistant", ask);
+      return res.json({ reply: ask });
+    }
+
+    // 4) Prepare base messages (system + memory + current)
+    const systemPrompt = `
+You are "Trucks Helper" — a precise, friendly truck expert.
+- Keep answers concise and task-focused. No generic lists.
+- Use the user's known vehicle profile when giving fitment or product guidance.
+- If the user asks a HOW-TO (e.g., "how to change brake pads"), first give a clear step-by-step procedure with safety notes, then suggest exact parts for that vehicle.
+- If a fitment detail is missing, ask a SINGLE follow-up question (once).
+- Do not paste URLs; the system will attach links afterwards.
+`;
+
+    const base = [{ role: "system", content: systemPrompt }, ...sess.history];
+
+    // 5) Generate the assistant response
+    const isHowTo = looksLikeHowTo(message);
+    const temperature = isHowTo ? 0.4 : 0.5;
+
+    const r = await client.chat.completions.create({
+      model: MODEL,
+      temperature,
+      messages: base
+    });
+
+    let reply = r?.choices?.[0]?.message?.content
+      || "I couldn't find a clear answer. Tell me your truck year, make and model.";
+
+    // 6) After we write the answer, fetch ONLY the relevant products
+    let productType = null;
+    if (isHowTo && /brake/i.test(message)) {
+      productType = "brake pads";
+    } else if (/brake pad|brakes|rotor/i.test(message)) {
+      productType = "brake pads";
+    } else if (/tonneau|bed cover/i.test(message)) {
+      productType = "tonneau cover";
+    } else if (/lift kit|leveling/i.test(message)) {
+      productType = "lift kit";
+    } else if (/tire|all terrain|mud terrain/i.test(message)) {
+      productType = "tires";
+    }
+    // You can extend the mapping above as needed…
+
+    let lines = [];
+    if (productType) {
+      // Build a precise tool query using remembered vehicle
+      const q = {
+        query: `${vehicle.year||""} ${vehicle.make||""} ${vehicle.model||""} ${productType}`.trim(),
+        vehicle: `${vehicle.year||""} ${vehicle.make||""} ${vehicle.model||""}`.trim(),
+        type: productType,
+        limit: 3
+      };
+      const picks = getBestAffiliateLinks(q) || [];
+
+      // Only output if we truly have product matches (Amazon links)
+      const amazonOnly = picks.filter(p => /(^https?:\/\/(www\.)?(amzn\.to|amazon\.[a-z.]+)\/)/i.test(p.url)).slice(0,3);
+
+      if (amazonOnly.length) {
+        lines = amazonOnly.map(p => tinyLinkLine(p.name || `${p.brand||""} ${p.type||""}`.trim(), p.url));
+      }
+    }
+
+    // 7) Compose final reply (assistant text + tiny amazon links)
+    if (lines.length) {
+      reply = `${reply}
 
 You might consider:
 ${lines.join("\n")}
 As an Amazon Associate, we may earn from qualifying purchases.`;
-}
-
-/* ---------------------------------------
-   Chat endpoint (ChatGPT-style)
----------------------------------------- */
-app.post("/chat", async (req, res) => {
-  try {
-    const { message } = req.body || {};
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ reply: "Missing 'message' (string) in body." });
     }
 
-    const systemPrompt = `
-You are "Trucks Helper" — a friendly truck expert that talks like a human.
-STYLE:
-- Plain text only (NO markdown like ** or #).
-- Short, natural sentences with the occasional emoji.
-- Give 2–3 specific product suggestions when relevant.
-- Summarize what owners like/dislike from real-world experience (tone only; no fake numbers).
-- Never paste raw URLs in the main text. The system will append small "View on Amazon" links after your message.
-- Add one practical tip when useful. Keep it helpful and concise.
-`;
-
-    const r = await client.chat.completions.create({
-      model: MODEL,
-      temperature: 0.6,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user",    content: message }
-      ]
-    });
-
-    let reply = r?.choices?.[0]?.message?.content
-      || "I couldn't find a clear answer. Tell me your truck year, bed length, and typical use.";
-
-    // Add tiny inline Amazon links (no big cards)
-    reply = appendInlineAmazonLinks(message, reply);
-
+    // 8) Save assistant message in memory and return
+    pushHistory(sess, "assistant", reply);
     return res.json({ reply });
+
   } catch (e) {
     console.error("[/chat] error", e?.response?.data || e.message || e);
     return res.json({
-      reply: "I’m having trouble reaching the AI right now. Meanwhile, UnderCover, BAKFlip and Retrax are solid picks for hard folding covers."
+      reply: "I’m having trouble reaching the AI right now. Meanwhile, if you share your truck year/make/model, I’ll fetch exact parts that fit."
     });
   }
 });
 
 /* --------------------------------------- */
-app.listen(PORT, () => console.log(`🚀 Truckbot running (chat + inline links) on :${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Truckbot running (precise + session memory) on :${PORT}`));
