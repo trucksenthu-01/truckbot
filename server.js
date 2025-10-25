@@ -5,149 +5,164 @@ import cors from "cors";
 import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
+import { extractIntent, getBestAffiliateLinks } from "./recommend.js";
 
 /* -----------------------------
-   Load Affiliate Data
+   Load affiliate data
 ------------------------------ */
 let affiliateMap = [];
-try {
-  const filePath = path.resolve("./data/affiliateMap_enriched.json");
-  const data = fs.readFileSync(filePath, "utf8");
-  affiliateMap = JSON.parse(data);
-  console.log(`[server] ✅ Loaded ${affiliateMap.length} affiliate entries`);
-} catch (err) {
-  console.warn("[server] ⚠️ Could not load affiliateMap_enriched.json:", err.message);
+function safeLoadJSON(p, fallback = []) {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch (e) {
+    console.warn("[server] Could not load", p, e.message);
+    return fallback;
+  }
 }
+affiliateMap = safeLoadJSON(path.resolve("./data/affiliateMap_enriched.json"), []);
+console.log(`[server] ✅ Loaded ${affiliateMap.length} affiliate items`);
 
 /* -----------------------------
-   App + Middleware Setup
+   App setup
 ------------------------------ */
 const app = express();
 app.use(bodyParser.json());
 
 const allowed = (process.env.ALLOWED_ORIGINS || "https://trucksenthusiasts.com")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(",").map(s => s.trim()).filter(Boolean);
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      const ok = !origin || allowed.length === 0 || allowed.includes(origin);
-      cb(null, ok);
-    },
-  })
-);
+app.use(cors({
+  origin: (origin, cb) => cb(null, !origin || allowed.length === 0 || allowed.includes(origin)),
+}));
 
-const apiKey = process.env.OPENAI_API_KEY;
-const client = new OpenAI({ apiKey });
-const MODEL = process.env.MODEL || "gpt-4o-mini";
-const PORT = process.env.PORT || 3000;
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const MODEL  = process.env.MODEL || "gpt-4o-mini";
+const PORT   = process.env.PORT || 3000;
 
 /* -----------------------------
-   Helper: Build image link from ASIN
+   Helpers
 ------------------------------ */
 function amazonImageFromASIN(asin, marketplace = "US") {
   if (!asin) return null;
   return `https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN=${asin}&Format=_SL400_&ID=AsinImage&MarketPlace=${marketplace}&ServiceVersion=20070822`;
 }
 
-/* -----------------------------
-   Affiliate Injector with Images
------------------------------- */
-function injectAffiliateContent(replyText = "") {
-  if (!replyText || !affiliateMap.length) return replyText;
+const stopwords = new Set(["the","a","an","for","to","of","on","with","and","or","best","good","great","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota"]);
+function norm(s="") {
+  return s.toLowerCase().replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim();
+}
+function tokens(s="") {
+  return norm(s).split(" ").filter(t => t && !stopwords.has(t));
+}
+function jaccard(aSet, bSet) {
+  const a = new Set(aSet); const b = new Set(bSet);
+  const inter = [...a].filter(x => b.has(x)).length;
+  const uni = new Set([...a, ...b]).size || 1;
+  return inter / uni;
+}
 
-  let reply = replyText;
-  const lower = reply.toLowerCase();
+/** Fuzzy match products mentioned in the text. */
+function fuzzyFindProducts(text, max = 3) {
+  const tks = tokens(text);
+  const scored = affiliateMap.map(item => {
+    const name = [item.brand || "", item.name || ""].join(" ");
+    const score = jaccard(tks, tokens(name));
+    return { item, score };
+  }).filter(x => x.score > 0.12); // loose threshold
+  scored.sort((a,b) => b.score - a.score);
+  return scored.slice(0, max).map(x => x.item);
+}
 
-  // Find matching products
-  const found = affiliateMap
-    .filter(
-      item =>
-        lower.includes(item.brand?.toLowerCase() || "") ||
-        lower.includes(item.name?.toLowerCase() || "")
-    )
-    .slice(0, 3);
-
-  if (found.length) {
-    const cards = found.map(p => {
-      const img = p.asin ? amazonImageFromASIN(p.asin) : null;
-      const safeName = p.name || p.brand;
-      const safeLink = p.url;
-
-      return `
-        <div style="border:1px solid #233244;border-radius:12px;padding:12px;margin:8px 0;
-                    background:#0f1620;color:#fff;max-width:480px;">
-          <div style="font-weight:600;margin-bottom:6px;">${safeName}</div>
-          ${img ? `<img src="${img}" alt="${safeName}" width="320" loading="lazy"
-                     style="border-radius:10px;margin-bottom:8px;display:block;">` : ""}
-          <a href="${safeLink}" target="_blank" rel="nofollow sponsored noopener"
-             style="display:inline-block;padding:8px 12px;border-radius:10px;
-                    background:#1f6feb;color:#fff;text-decoration:none;">
-            👉 View on Amazon
-          </a>
-        </div>
-      `;
-    });
-
-    reply += `
-      <br><br>
-      <div style="font-weight:600;margin-top:12px;">💡 You might like these:</div>
-      ${cards.join("")}
-      <p style="font-size:12px;opacity:.75;margin-top:8px;">
-        As an Amazon Associate, we may earn from qualifying purchases.
-      </p>
+/** Build HTML product cards. */
+function renderCards(items) {
+  return items.map(p => {
+    const title = p.name || `${p.brand || ""} ${p.type || ""}`.trim() || "Product";
+    const img = p.asin ? amazonImageFromASIN(p.asin) : null;
+    const url = p.url || "#";
+    return `
+      <div style="border:1px solid #233244;border-radius:12px;padding:12px;margin:8px 0;background:#0f1620;color:#fff;max-width:520px">
+        <div style="font-weight:600;margin-bottom:6px">${title}</div>
+        ${img ? `<img src="${img}" alt="${title}" width="320" loading="lazy" style="border-radius:10px;margin:6px 0">` : ""}
+        <a href="${url}" target="_blank" rel="nofollow sponsored noopener"
+           style="display:inline-block;padding:8px 12px;border-radius:10px;background:#1f6feb;color:#fff;text-decoration:none">
+          👉 View on Amazon
+        </a>
+      </div>
     `;
+  }).join("");
+}
+
+/** Append affiliate block to a plain-text reply. */
+function appendAffiliate(message, reply) {
+  // 1) Try fuzzy match from what the model wrote
+  let picks = fuzzyFindProducts(reply);
+
+  // 2) If none, fall back to our recommender using the user's message intent
+  if (!picks.length) {
+    const intent = extractIntent(message || "");
+    picks = getBestAffiliateLinks({ ...intent, query: message, limit: 3 }) || [];
   }
 
-  return reply;
+  if (!picks.length) return reply; // nothing to add
+
+  const cardsHtml = renderCards(picks);
+  return `${reply}
+<br><br><div style="font-weight:600;margin-top:6px">💡 You might like these:</div>
+${cardsHtml}
+<p style="font-size:12px;opacity:.75;margin-top:6px">
+  As an Amazon Associate, we may earn from qualifying purchases.
+</p>`;
 }
 
 /* -----------------------------
-   Chat Endpoint
+   Diagnostics
+------------------------------ */
+app.get("/health", (_req,res)=>res.send("ok"));
+app.get("/diag", (_req,res)=>res.json({
+  ok:true, model: MODEL, has_api_key: !!process.env.OPENAI_API_KEY,
+  affiliate_entries: affiliateMap.length, allowed_origins: allowed
+}));
+
+/* -----------------------------
+   Chat endpoint
 ------------------------------ */
 app.post("/chat", async (req, res) => {
   try {
     const { message } = req.body || {};
-    if (!message) return res.status(400).json({ reply: "Please include 'message' in the request body." });
-
-    console.log(`[chat] Message: ${message}`);
+    if (!message || typeof message !== "string")
+      return res.status(400).json({ reply: "Missing 'message' (string) in body." });
 
     const systemPrompt = `
-You are "Trucks Helper" — a friendly, knowledgeable truck expert chatbot like ChatGPT.
-You can answer any truck-related question: lift kits, tonneau covers, tires, towing, etc.
-Be natural, conversational, and concise — sound human.
-Write in Markdown style for bold text and line breaks.
-Avoid giving Amazon links yourself — they’ll be added automatically.
+You are "Trucks Helper" — a friendly, concise truck expert.
+STYLE:
+- Plain text only (NO markdown, NO **bold**, NO links).
+- Short, natural sentences with emojis when helpful.
+- 2–3 specific product names if relevant; keep it brief.
+- Never paste URLs. The system will add links/cards afterwards.
+- Add one practical tip when useful.
 `;
 
-    // Generate ChatGPT-style answer
     const r = await client.chat.completions.create({
       model: MODEL,
-      temperature: 0.7,
+      temperature: 0.6,
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: message },
-      ],
+        { role: "user", content: message }
+      ]
     });
 
-    let reply = r?.choices?.[0]?.message?.content || "Sorry, I couldn’t come up with an answer right now.";
-
-    // Inject affiliate links + images
-    reply = injectAffiliateContent(reply);
+    let reply = r?.choices?.[0]?.message?.content || "I couldn't find a good answer. Tell me your truck year and bed length.";
+    // Add affiliate content (fuzzy + fallback recommender), rendered as HTML cards
+    reply = appendAffiliate(message, reply);
 
     res.json({ reply });
-  } catch (err) {
-    console.error("[/chat] error", err);
+  } catch (e) {
+    console.error("[/chat] error", e?.response?.data || e.message || e);
     res.json({
-      reply:
-        "⚠️ I’m having trouble connecting to the AI right now. Meanwhile, check these trusted brands: UnderCover, BAKFlip, and Retrax.",
+      reply: "I’m having trouble reaching the AI right now. Meanwhile, UnderCover, BAKFlip and Retrax are solid choices for hard folding covers."
     });
   }
 });
 
-/* -----------------------------
-   Start Server
------------------------------- */
-app.listen(PORT, () => console.log(`🚀 Truckbot running with images on :${PORT}`));
+/* ----------------------------- */
+app.listen(PORT, () => console.log(`🚀 Truckbot running on :${PORT}`));
