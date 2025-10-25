@@ -3,58 +3,29 @@ import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
 import OpenAI from "openai";
-import { getBestAffiliateLinks, extractIntent } from "./recommend.js";
+import fs from "fs";
+import path from "path";
 
-/* ---------------------- HELPERS ---------------------- */
-function amazonImageFromASIN(asin, marketplace = "US") {
-  if (!asin) return null;
-  return `https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&ASIN=${asin}&Format=_SL500_&ID=AsinImage&MarketPlace=${marketplace}&ServiceVersion=20070822`;
-}
-function normalizePick(it) {
-  return {
-    title: it?.name || `${it?.brand || ""} ${it?.type || ""}`.trim(),
-    brand: it?.brand || "",
-    type: it?.type || "",
-    asin: it?.asin || "",
-    url: it?.url || "#",
-    img: amazonImageFromASIN(it?.asin),
-  };
-}
-function buildModelContext(picks = [], intent = {}) {
-  const clean = picks.map(normalizePick);
-  return {
-    intent: {
-      vehicle: intent.vehicle || null,
-      type: intent.type || null,
-      brand: intent.brand || null,
-    },
-    picks: clean,
-  };
-}
-function blogPrompt(ctx) {
-  const v = ctx.intent.vehicle ? ctx.intent.vehicle.replace("-", " ").toUpperCase() : "the truck";
-  const t = ctx.intent.type || "the upgrade";
-  return `
-You are a professional truck accessories reviewer. Write an informative blog post comparing top products.
-
-CONTEXT:
-- Vehicle: ${v}
-- Product type: ${t}
-- Items: ${JSON.stringify(ctx.picks)}
-
-RULES:
-- Use HTML only (no markdown).
-- Include: Intro → Top Picks (each with image, mini-review, pros/cons, and affiliate link) → How They Differ → Which One Should You Pick → Disclosure.
-- Keep factual, trustworthy, easy to scan.
-- Avoid repetition or overlong sentences.
-`;
+/* -----------------------------
+   Load affiliate data
+------------------------------ */
+let affiliateMap = [];
+try {
+  const filePath = path.resolve("./data/affiliateMap_enriched.json");
+  const data = fs.readFileSync(filePath, "utf8");
+  affiliateMap = JSON.parse(data);
+  console.log(`[server] ✅ Loaded ${affiliateMap.length} affiliate entries`);
+} catch (err) {
+  console.warn("[server] ⚠️ Could not load affiliateMap_enriched.json:", err.message);
 }
 
-/* ---------------------- APP SETUP ---------------------- */
+/* -----------------------------
+   App + Middleware Setup
+------------------------------ */
 const app = express();
 app.use(bodyParser.json());
 
-const allowed = (process.env.ALLOWED_ORIGINS || "")
+const allowed = (process.env.ALLOWED_ORIGINS || "https://trucksenthusiasts.com")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
@@ -73,147 +44,91 @@ const client = new OpenAI({ apiKey });
 const MODEL = process.env.MODEL || "gpt-4o-mini";
 const PORT = process.env.PORT || 3000;
 
-/* ---------------------- ENDPOINTS ---------------------- */
+/* -----------------------------
+   Health Check
+------------------------------ */
 app.get("/health", (_, res) => res.send("ok"));
 app.get("/diag", (_, res) =>
   res.json({
     ok: true,
     model: MODEL,
-    has_api_key: !!apiKey,
+    affiliate_entries: affiliateMap.length,
     allowed_origins: allowed,
+    has_api_key: !!apiKey,
   })
 );
 
-/* ---------------------- CHAT ---------------------- */
+/* -----------------------------
+   Affiliate Injector
+------------------------------ */
+function injectAffiliateLinks(replyText = "") {
+  if (!replyText || !affiliateMap.length) return replyText;
+
+  let reply = replyText;
+  const lower = reply.toLowerCase();
+  const found = affiliateMap
+    .filter(
+      item =>
+        lower.includes(item.brand?.toLowerCase() || "") ||
+        lower.includes(item.name?.toLowerCase() || "")
+    )
+    .slice(0, 3);
+
+  if (found.length) {
+    const lines = found.map(
+      p =>
+        `👉 [${p.name || p.brand} – View on Amazon](${p.url})`
+    );
+    reply +=
+      `\n\n💡 You might like these:\n${lines.join("\n")}\n\n_As an Amazon Associate, we may earn from qualifying purchases._`;
+  }
+
+  return reply;
+}
+
+/* -----------------------------
+   Chat Endpoint
+------------------------------ */
 app.post("/chat", async (req, res) => {
   try {
     const { message } = req.body || {};
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ reply: "Missing 'message' (string) in body." });
-    }
+    if (!message) return res.status(400).json({ reply: "Please include 'message' in the request body." });
 
+    console.log(`[chat] Message: ${message}`);
+
+    // ChatGPT-style system prompt
     const systemPrompt = `
-You are "Trucks Helper" — a smart, friendly AI that helps truck owners pick the right accessories.
-- Use 'get_affiliate_links' when users ask about products or recommendations.
-- Always be safe, clear, and friendly.
+You are "Trucks Helper" — a friendly, knowledgeable truck expert like ChatGPT.
+You can answer any truck-related question (lift kits, tonneau covers, tires, towing, etc.).
+Be natural, concise, and friendly.
+Whenever you mention a product brand or accessory, the system will add affiliate links automatically.
 `;
 
-    // --- Pass 1: figure out intent + products ---
+    // Generate ChatGPT-style answer
     const r = await client.chat.completions.create({
       model: MODEL,
+      temperature: 0.7,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: message },
       ],
-      tools: [
-        {
-          type: "function",
-          function: {
-            name: "get_affiliate_links",
-            description: "Return 1–3 affiliate URLs best matching the query.",
-            parameters: {
-              type: "object",
-              properties: {
-                query: { type: "string" },
-                vehicle: { type: "string" },
-                type: { type: "string" },
-                brand: { type: "string" },
-                limit: { type: "number" },
-              },
-              required: ["query"],
-            },
-          },
-        },
-      ],
-      tool_choice: "auto",
-      temperature: 0.4,
     });
 
-    const msg = r?.choices?.[0]?.message;
-    if (!msg?.tool_calls?.length) {
-      return res.json({ reply: msg?.content || "I'm ready for your next question!" });
-    }
+    let reply = r?.choices?.[0]?.message?.content || "Sorry, I couldn’t come up with an answer right now.";
+    reply = injectAffiliateLinks(reply);
 
-    // --- Extract affiliate picks ---
-    const call = msg.tool_calls[0];
-    const args = JSON.parse(call.function.arguments || "{}");
-    const inferred = extractIntent(args.query || message || "");
-    const mergedArgs = { limit: 3, ...inferred, ...args };
-    const picks = getBestAffiliateLinks(mergedArgs) || [];
-
-    if (!picks.length) {
-      return res.json({
-        reply: "Hmm, I couldn't find a perfect match yet. Can you tell me your truck’s year or bed length?",
-      });
-    }
-
-    const ctx = buildModelContext(picks, mergedArgs);
-
-    // --- AUTO-DETECT MODE ---
-    const lowerMsg = message.toLowerCase();
-    const wantsBlog =
-      lowerMsg.includes("detailed") ||
-      lowerMsg.includes("review") ||
-      lowerMsg.includes("compare") ||
-      lowerMsg.includes("pros") ||
-      lowerMsg.includes("cons") ||
-      lowerMsg.includes("in-depth") ||
-      lowerMsg.includes("write article") ||
-      lowerMsg.includes("long") ||
-      lowerMsg.includes("full guide");
-
-    // --- BLOG MODE ---
-    if (wantsBlog) {
-      const writing = await client.chat.completions.create({
-        model: MODEL,
-        temperature: 0.4,
-        messages: [
-          { role: "system", content: "You write detailed HTML blog reviews for truck accessories." },
-          { role: "user", content: blogPrompt(ctx) },
-        ],
-      });
-      const html = writing?.choices?.[0]?.message?.content || "";
-      return res.json({ reply: html });
-    }
-
-    // --- CHAT MODE ---
-    const writing = await client.chat.completions.create({
-      model: MODEL,
-      temperature: 0.6,
-      messages: [
-        {
-          role: "system",
-          content: `
-You are a friendly truck expert chatbot that replies like a human.
-
-Style:
-- Short, natural sentences with emojis.
-- Give 2–3 top recommendations with quick pros.
-- Replace raw Amazon URLs with text like "👉 [View More]" or "👉 [Check Here]" (use markdown link syntax).
-- No plain links visible.
-- No headings or long paragraphs.
-- End with a friendly tip.
-Example:
-💪 Tyger Auto T3 – budget soft tri-fold cover.  
-👉 [View More](https://amzn.to/example)`,
-        },
-        {
-          role: "user",
-          content: `User asked: ${message}
-Here are matching products: ${JSON.stringify(picks, null, 2)}`,
-        },
-      ],
-    });
-    const reply = writing?.choices?.[0]?.message?.content || "";
-    return res.json({ reply });
-  } catch (e) {
-    console.error("[/chat] error", e);
+    // Respond
+    res.json({ reply });
+  } catch (err) {
+    console.error("[/chat] error", err);
     res.json({
       reply:
-        "⚠️ I'm having trouble reaching the AI right now. Meanwhile, check: UnderCover / BAK / Retrax on Amazon.",
+        "⚠️ I’m having trouble connecting to the AI right now. Meanwhile, check these trusted brands: UnderCover, BAKFlip, and Retrax.",
     });
   }
 });
 
-/* ---------------------- START SERVER ---------------------- */
-app.listen(PORT, () => console.log(`🚀 Truckbot running on :${PORT}`));
+/* -----------------------------
+   Start Server
+------------------------------ */
+app.listen(PORT, () => console.log(`🚀 Truckbot running like ChatGPT on :${PORT}`));
