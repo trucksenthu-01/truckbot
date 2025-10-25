@@ -1,30 +1,16 @@
-// server.js — Precise chat + session memory + inline affiliate hyperlinks
+// server.js — Precise chat + session memory + Amazon search links (no affiliateMap)
 // - Remembers conversation per session (year/make/model, etc.)
 // - How-to answers (with safety) when asked
-// - Vehicle-targeted product picks (Amazon only)
-// - Injects clickable affiliate hyperlinks directly in the main reply text
-// - Adds a small suggestion block when a product type is detected
+// - Auto-builds Amazon search URLs with your affiliate tag
+// - Injects clickable search links directly in the main reply text
+// - Adds a small suggestion block with 2–3 search links
 
 import "dotenv/config";
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
 import OpenAI from "openai";
-import fs from "fs";
-import path from "path";
-import { extractIntent, getBestAffiliateLinks } from "./recommend.js";
-
-/* ---------------------------------------
-   Load affiliate data (supports root or /data)
----------------------------------------- */
-function safeLoadJSON(p, fallback = []) {
-  try { return JSON.parse(fs.readFileSync(p, "utf8")); }
-  catch (e) { console.warn("[server] Could not load", p, e.message); return fallback; }
-}
-const ROOT_AFF = path.resolve("./affiliateMap_enriched.json");
-const DATA_AFF = path.resolve("./data/affiliateMap_enriched.json");
-const affiliateMap = safeLoadJSON(fs.existsSync(DATA_AFF) ? DATA_AFF : ROOT_AFF, []);
-console.log(`[server] ✅ Loaded ${affiliateMap.length} affiliate entries`);
+import { extractIntent } from "./recommend.js"; // reuse your existing intent extractor
 
 /* ---------------------------------------
    Express + CORS
@@ -101,12 +87,27 @@ function missingFitment(vehicle) {
 }
 
 /* ---------------------------------------
-   Tiny suggestion line
+   Amazon search links (affiliate)
 ---------------------------------------- */
-function tinyLinkLine(name, url, ownerNote = "owners like the fit and performance") {
-  const safe = name || "View on Amazon";
-  const link = url || "#";
-  return `• ${safe} — ${ownerNote}. 👉 <a href="${link}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
+function amazonDomainFromCC(cc="com") {
+  const tld = (cc || "com").toLowerCase();
+  return `https://www.amazon.${tld}`;
+}
+function buildAmazonSearchURL(query, { tag, marketplace } = {}) {
+  const base = amazonDomainFromCC(marketplace || process.env.AMAZON_MARKETPLACE || "com");
+  const params = new URLSearchParams();
+  params.set("k", query);
+  const assoc = tag || process.env.AFFILIATE_TAG;
+  if (assoc) params.set("tag", assoc);
+  return `${base}/s?${params.toString()}`;
+}
+
+/* ---------------------------------------
+   Tiny suggestion line (for the footer block)
+---------------------------------------- */
+function tinySearchLine(q) {
+  const url = buildAmazonSearchURL(q);
+  return `• ${q} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
 /* ========= Inline link helpers (fuzzy + markdown strip) ========= */
@@ -137,17 +138,15 @@ function buildOrderedTokenRegex(name) {
 
 /**
  * Inject affiliate hyperlinks directly into the reply text.
- * - Fuzzy matches brand+model tokens
- * - Works even if AI writes small spelling differences
+ * products = [{ name: "BakFlip MX4", url: "<amazon search link>" }, ...]
  */
 function injectAffiliateLinks(replyText = "", products = []) {
   if (!replyText || !Array.isArray(products) || !products.length) return replyText;
-
   let out = stripMarkdownBasic(replyText);
 
   for (const p of products) {
     const url = p?.url;
-    const full = p?.name || `${p?.brand || ""} ${p?.type || ""}`.trim();
+    const full = p?.name;
     if (!url || !full) continue;
 
     // 1) token-ordered fuzzy match (brand + model)
@@ -173,13 +172,58 @@ function injectAffiliateLinks(replyText = "", products = []) {
 }
 
 /* ---------------------------------------
+   Build Amazon search queries from reply/message
+---------------------------------------- */
+function extractProductQueries({ userMsg, modelReply, vehicle, productType, max = 3 }) {
+  const q = [];
+
+  // 1) If we detected a productType, prefer vehicle-scoped queries
+  if (productType) {
+    const veh = [vehicle?.year, vehicle?.make, vehicle?.model].filter(Boolean).join(" ");
+    if (veh) q.push(`${veh} ${productType}`);
+    q.push(`${productType} ${vehicle?.make || ""} ${vehicle?.model || ""}`.trim());
+  }
+
+  // 2) Pull brand+model phrases that often show up in truck accessories
+  const m = (modelReply || "").match(/\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z0-9\.\-]+){0,3})\b/g) || [];
+  const whitelist = [
+    "BAKFlip","UnderCover","TruXedo","Extang","Retrax","Gator","Rough Country",
+    "Bilstein","DiabloSport","Hypertech","Motorcraft","Power Stop","WeatherTech",
+    "Tyger","Nitto","BFGoodrich","Falken","K&N","Borla","Flowmaster","Gator EFX",
+    "ArmorFlex","MX4","Ultra Flex","Lo Pro","Sentry CT","Solid Fold"
+  ];
+  m.forEach(s => {
+    if (whitelist.some(w => s.toLowerCase().includes(w.toLowerCase()))) q.push(s);
+  });
+
+  // 3) Fallback to the user message itself if nothing else
+  if (q.length === 0 && userMsg) q.push(userMsg);
+
+  // de-dup + trim + top-N
+  const seen = new Set();
+  const out = [];
+  for (const s of q) {
+    const key = s.toLowerCase().trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(s.trim());
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+/* ---------------------------------------
    Diagnostics
 ---------------------------------------- */
 app.get("/health", (_req,res)=>res.send("ok"));
 app.get("/diag", (_req,res)=>res.json({
-  ok:true, model: MODEL, has_api_key: !!process.env.OPENAI_API_KEY,
-  affiliate_entries: affiliateMap.length, allowed_origins: allowed,
-  sessions: SESSIONS.size
+  ok:true,
+  model: MODEL,
+  has_api_key: !!process.env.OPENAI_API_KEY,
+  allowed_origins: allowed,
+  sessions: SESSIONS.size,
+  affiliate_tag: process.env.AFFILIATE_TAG || null,
+  amazon_marketplace: process.env.AMAZON_MARKETPLACE || "com"
 }));
 
 // Quick UI test: if this isn't clickable in your chat, switch to innerHTML in the widget
@@ -241,7 +285,7 @@ You are "Trucks Helper" — a precise, friendly truck expert.
     let reply = r?.choices?.[0]?.message?.content
       || "I couldn't find a clear answer. Tell me your truck year, make and model.";
 
-    // 6) Product-type routing for targeted picks
+    // 6) Product-type routing for targeted queries
     let productType = null;
     const m = message.toLowerCase();
     if (isHowTo && /brake|pad|rotor/.test(m)) {
@@ -259,33 +303,24 @@ You are "Trucks Helper" — a precise, friendly truck expert.
     }
     // Extend mappings as needed…
 
-    // 7) If we know the product type, fetch 1–3 exact Amazon picks
-    let lines = [];
-    let amazonOnly = [];
-    if (productType) {
-      const q = {
-        query: `${vehicle.year||""} ${vehicle.make||""} ${vehicle.model||""} ${productType}`.trim(),
-        vehicle: `${vehicle.year||""} ${vehicle.make||""} ${vehicle.model||""}`.trim(),
-        type: productType,
-        limit: 3
-      };
-      const picks = getBestAffiliateLinks(q) || [];
-      amazonOnly = picks.filter(p => /(^https?:\/\/(www\.)?(amzn\.to|amazon\.[a-z.]+)\/)/i.test(p.url)).slice(0,3);
-      if (amazonOnly.length) {
-        lines = amazonOnly.map(p => tinyLinkLine(p.name || `${p.brand||""} ${p.type||""}`.trim(), p.url));
-      }
-    }
+    // 7) Build Amazon search queries from message + model reply
+    const queries = extractProductQueries({
+      userMsg: message,
+      modelReply: reply,
+      vehicle,
+      productType,
+      max: 3
+    });
 
-    // 8) Inject affiliate hyperlinks directly in the MAIN TEXT
-    //    Prefer the targeted 'amazonOnly' list if present; else fall back to full dataset
-    if (amazonOnly.length) {
-      reply = injectAffiliateLinks(reply, amazonOnly);
-    } else {
-      reply = injectAffiliateLinks(reply, affiliateMap);
-    }
+    // 8) Inline-link product phrases in the MAIN TEXT to Amazon search (with your tag)
+    reply = injectAffiliateLinks(
+      reply,
+      queries.map(q => ({ name: q, url: buildAmazonSearchURL(q) }))
+    );
 
-    // 9) Append tiny suggestion lines if we have targeted picks
-    if (lines.length) {
+    // 9) Append a small suggestion block if we have queries
+    if (queries.length) {
+      const lines = queries.map(tinySearchLine);
       reply = `${reply}
 
 You might consider:
@@ -306,4 +341,4 @@ As an Amazon Associate, we may earn from qualifying purchases.`;
 });
 
 /* --------------------------------------- */
-app.listen(PORT, () => console.log(`🚀 Truckbot running (precise + memory + inline links) on :${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Truckbot running (chat + memory + Amazon search links) on :${PORT}`));
