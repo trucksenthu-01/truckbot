@@ -5,10 +5,13 @@ import cors from "cors";
 import OpenAI from "openai";
 import { getBestAffiliateLinks, extractIntent } from "./recommend.js";
 
+// -------------------------
+// App + CORS
+// -------------------------
 const app = express();
 app.use(bodyParser.json());
 
-// CORS
+// Allow only your site (or multiple, comma-separated)
 const allowed = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
@@ -23,14 +26,22 @@ app.use(
   })
 );
 
-// OpenAI
+// -------------------------
+// OpenAI client
+// -------------------------
 const apiKey = process.env.OPENAI_API_KEY;
-if (!apiKey) console.warn("[warn] OPENAI_API_KEY not set — /chat calls will fail.");
+if (!apiKey) {
+  console.warn("[warn] OPENAI_API_KEY not set — /chat calls will fail.");
+}
 const client = new OpenAI({ apiKey });
-const MODEL = process.env.MODEL || "gpt-5";
+
+// Use a safe default if your account doesn't have gpt-5 access
+const MODEL = process.env.MODEL || "gpt-4o-mini";
 const PORT = process.env.PORT || 3000;
 
-// ---- Tool definition ----
+// -------------------------
+// Tool definition
+// -------------------------
 const tools = [
   {
     type: "function",
@@ -60,10 +71,23 @@ function callAffiliateTool(args) {
   return JSON.stringify({ results: list });
 }
 
-// Health
+// -------------------------
+// Health + diagnostics
+// -------------------------
 app.get("/health", (_req, res) => res.send("ok"));
 
-// Chat
+app.get("/diag", (_req, res) => {
+  res.json({
+    ok: true,
+    model: MODEL,
+    allowed_origins: allowed,
+    has_api_key: !!apiKey
+  });
+});
+
+// -------------------------
+// Chat endpoint
+// -------------------------
 app.post("/chat", async (req, res) => {
   try {
     const { message, session } = req.body || {};
@@ -88,7 +112,7 @@ Policy:
       { role: "user", content: message, name: userName }
     ];
 
-    // First pass
+    // Pass 1: let the model decide to call the tool
     let r = await client.chat.completions.create({
       model: MODEL,
       messages: baseMessages,
@@ -99,12 +123,15 @@ Policy:
 
     let msg = r?.choices?.[0]?.message;
 
-    // If tool is called, fulfill and do second pass
+    // If the model calls the tool, fulfill and do a second pass
     if (msg?.tool_calls?.length) {
       const call = msg.tool_calls[0];
       const args = JSON.parse(call.function.arguments || "{}");
+
+      // Merge inferred intent (vehicle/type/brand) with model-provided args
       const inferred = extractIntent(args.query || message || "");
       const mergedArgs = { limit: 3, ...inferred, ...args };
+
       const toolContent = callAffiliateTool(mergedArgs);
 
       const followup = [
@@ -127,11 +154,35 @@ Policy:
       msg = r?.choices?.[0]?.message;
     }
 
-    res.json({ reply: (msg?.content || "").replace(/\n\n/g, "<br><br>") });
+    const reply = (msg?.content || "Sorry, I couldn't generate a response right now.")
+      .replace(/\n\n/g, "<br><br>");
+
+    res.json({ reply });
   } catch (e) {
-    console.error("[/chat] error:", e);
-    res.status(500).json({ reply: "Sorry, something went wrong generating the answer." });
+    // -------- Improved error handling & logging --------
+    const status = e?.status || e?.response?.status || 500;
+    const data =
+      e?.response?.data ||
+      e?.error ||
+      e?.message ||
+      e;
+
+    console.error("[/chat] OpenAI error", { status, data });
+
+    // Graceful fallback so the widget never shows a hard error
+    return res.json({
+      reply:
+        "I’m having trouble reaching the AI right now. Meanwhile, here are a couple of popular picks you can check out:" +
+        "<br>• Hard folding tonneau covers (F-150): UnderCover / BAK" +
+        "<br>• Retractable covers (Ram 2500): Retrax / GatorTrax" +
+        "<br><br>Try again in a moment!"
+    });
   }
 });
 
-app.listen(PORT, () => console.log(`Truckbot running on :${PORT}`));
+// -------------------------
+// Start server
+// -------------------------
+app.listen(PORT, () => {
+  console.log(`Truckbot running on :${PORT}`);
+});
