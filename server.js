@@ -1,10 +1,10 @@
-// server.js — Chat + memory + guarded links + fallback + GEO (US/UK/CA) + steps/nerf-bars support
+// server.js — Chat + memory + guarded links + fallback + GEO (US/UK/CA)
 // - Remembers conversation per session (year/make/model, etc.)
-// - Gives how-to steps when asked, then suggests parts
-// - Builds Amazon SEARCH links with your affiliate tag (no product DB needed)
+// - Answers general questions WITHOUT demanding fitment
+// - Asks for fitment only for clear buying/fitment intent (cooldowned)
+// - Builds Amazon SEARCH links with your affiliate tag
 // - Injects clickable links ONLY for product-like queries
-// - Adds a small "You might consider" block when appropriate
-// - Fallback: if detection finds nothing, builds safe vehicle/product search
+// - Fallback search when needed
 // - GEO: US/UK/CA -> .com / .co.uk / .ca (others use AMAZON_MARKETPLACE or .com)
 
 import "dotenv/config";
@@ -40,7 +40,7 @@ const PORT   = process.env.PORT || 3000;
 /* ---------------------------------------
    In-memory session store (simple)
 ---------------------------------------- */
-const SESSIONS = new Map(); // sessionId -> { history: Message[], vehicle: {...} }
+const SESSIONS = new Map(); // sessionId -> { history: Message[], vehicle: {...}, _asked_fitment_at?: ts }
 const MAX_TURNS = 12;
 
 function getSession(sessionId) {
@@ -57,10 +57,10 @@ function pushHistory(sess, role, content) {
 }
 
 /* ---------------------------------------
-   Utilities: intent, vehicle memory, product-type detection
+   Utilities: intent, vehicle memory
 ---------------------------------------- */
 const HOWTO_KEYWORDS = [
-  "how to", "how do i", "procedure", "steps", "install", "replace", "change", "fix", "tutorial"
+  "how to","how do i","procedure","steps","install","replace","change","fix","tutorial"
 ];
 function looksLikeHowTo(text="") {
   const t = text.toLowerCase();
@@ -90,12 +90,7 @@ function missingFitment(vehicle) {
 /* ---------------------------------------
    GEO (US/UK/CA only) -> marketplace TLD
 ---------------------------------------- */
-const COUNTRY_TO_TLD_LIMITED = {
-  US: "com",
-  GB: "co.uk",
-  UK: "co.uk",
-  CA: "ca",
-};
+const COUNTRY_TO_TLD_LIMITED = { US:"com", GB:"co.uk", UK:"co.uk", CA:"ca" };
 
 function normalizeCountry(c) {
   if (!c) return null;
@@ -104,11 +99,9 @@ function normalizeCountry(c) {
   const m = s.match(/[-_](\w{2})$/); // e.g., en-US
   return m ? m[1].toUpperCase() : s.substring(0,2).toUpperCase();
 }
-
 function detectCountryLimited(req, explicitCountry) {
   const direct = normalizeCountry(explicitCountry);
   if (direct) return direct;
-
   const h = req.headers || {};
   const cf  = normalizeCountry(h["cf-ipcountry"]);
   if (cf) return cf;
@@ -116,7 +109,6 @@ function detectCountryLimited(req, explicitCountry) {
   if (ver) return ver;
   const gen = normalizeCountry(h["x-country-code"]);
   if (gen) return gen;
-
   const al = h["accept-language"];
   if (al) {
     const first = al.split(",")[0].trim(); // en-US
@@ -125,7 +117,6 @@ function detectCountryLimited(req, explicitCountry) {
   }
   return null;
 }
-
 function resolveMarketplace(countryLimited) {
   if (countryLimited && COUNTRY_TO_TLD_LIMITED[countryLimited]) {
     return COUNTRY_TO_TLD_LIMITED[countryLimited];
@@ -220,7 +211,6 @@ const BRAND_WHITELIST = [
 const PRODUCT_TERMS =
   /(tonneau|bed\s*cover|lift\s*kit|level(ing)?\s*kit|tire|wheel|brake|pad|rotor|shock|strut|bumper|nerf\s*bar|nerf\s*bars|running\s*board|running\s*boards|side\s*step|side\s*steps|step\s*bar|step\s*bars|power ?step|tuner|programmer|intake|filter|exhaust|coilover|spring|winch|hitch|battery|floor\s*mat|bed\s*liner|rack|headlight|taillight)/i;
 
-// Stronger product-like gate (case-insensitive brands + nouns)
 function isProductLike(text = "") {
   if (!text) return false;
   if (PRODUCT_TERMS.test(text)) return true;
@@ -229,6 +219,14 @@ function isProductLike(text = "") {
     const esc = b.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`\\b${esc}\\b`, "i").test(lower);
   });
+}
+
+/* ---------- New: intent gates for fitment ask ---------- */
+function isGeneralInfoIntent(s = "") {
+  return /(issue|issues|problem|symptom|noise|vibration|cause|risk|signs|maintenance|service|interval|torque|how to|steps|procedure|install|remove|replace|why|what|explain|guide|tips|troubleshoot|diagnose|difference|pros|cons|lifespan|wear)/i.test(s);
+}
+function isBuyingOrFitmentIntent(s = "") {
+  return /(fit|fitment|compatible|which|exact|part|sku|model number|buy|price|link|recommend|best|options|where to buy)/i.test(s);
 }
 
 // Extract queries from reply + user + vehicle + productType
@@ -247,16 +245,14 @@ function extractProductQueries({ userMsg, modelReply, vehicle, productType, max 
     if (BRAND_WHITELIST.some(b => c.toLowerCase().includes(b.toLowerCase()))) out.push(c);
   }
 
-  // also scan user message for brands like "AMP Research PowerStep"
+  // also scan user message for brands
   const candidatesUser = (userMsg || "").match(/\b([A-Z][a-zA-Z]+(?:\s[A-Z0-9][a-zA-Z0-9\.\-]+){0,3})\b/g) || [];
   for (const c of candidatesUser) {
     if (BRAND_WHITELIST.some(b => c.toLowerCase().includes(b.toLowerCase()))) out.push(c);
   }
 
   // last resort: if it clearly looks producty, include the raw user message
-  if (!out.length && isProductLike(userMsg || "")) {
-    out.push(userMsg.trim());
-  }
+  if (!out.length && isProductLike(userMsg || "")) out.push(userMsg.trim());
 
   // de-dupe + cap
   const seen = new Set(); const deduped = [];
@@ -312,31 +308,42 @@ app.post("/chat", async (req, res) => {
     // 1) Update memory with the user's message
     pushHistory(sess, "user", message);
 
-    // 2) Extract/update vehicle profile from this turn
+    // 2) Extract/update vehicle profile
     const parsed = extractIntent(message || "");
     const vehicle = mergeVehicleMemory(sess, parsed);
 
-    // 3) Fitment askback if shopping but missing year/make/model
+    // 3) Fitment askback ONLY for clear buying/fitment intent + producty message
+    const msg = (message || "").toLowerCase();
     const miss = missingFitment(vehicle);
-    const wantsProducts = isProductLike(message);
-    if (wantsProducts && miss.length >= 2) {
+    const needFitment = isBuyingOrFitmentIntent(msg) && isProductLike(msg) && miss.length >= 2;
+    const nowTs = Date.now();
+    const askedRecently = sess._asked_fitment_at && (nowTs - sess._asked_fitment_at < 3 * 60 * 1000); // 3 min cooldown
+
+    if (needFitment && !askedRecently) {
       const ask = `To recommend exact parts, what is your truck's ${miss.join(" & ")}? (Example: 2019 Ford F-150 5.5 ft bed XLT)`;
+      sess._asked_fitment_at = nowTs;
       pushHistory(sess, "assistant", ask);
       return res.json({ reply: ask });
     }
 
-    // 4) Prompt + history
+    // 4) Prompt + history (encourage answering general info without fitment)
     const systemPrompt = `
 You are "Trucks Helper" — a precise, friendly truck expert.
-- Keep answers concise and task-focused. No generic lists.
-- Use the user's known vehicle profile when giving fitment or product guidance.
-- If the user asks a HOW-TO (e.g., "how to change brake pads"), first give a clear step-by-step procedure with safety notes, then suggest exact parts for that vehicle.
-- If a fitment detail is missing, ask a SINGLE follow-up question (once).
-- Do not paste URLs; the system will attach links afterwards.
+
+Core behavior:
+- If the user asks for general information (symptoms, causes, differences, maintenance, how-to steps, torque ranges, etc.), ANSWER DIRECTLY even if vehicle details are unknown. Provide applicable ranges and note variations by year/trim if relevant.
+- Use the stored vehicle profile when giving fitment or buying recommendations.
+- Only ask for missing vehicle details when the user clearly wants exact parts, fitment, or buying guidance. Ask at most once per thread; don't repeat unless the user shows buying intent again.
+
+How-to:
+- For "how to" requests, give clear, safety-first steps. If appropriate, suggest categories of parts and note which vehicle details affect selection.
+
+Links:
+- Do not paste URLs; the server injects shopping links afterward.
 `;
     const base = [{ role: "system", content: systemPrompt }, ...sess.history];
 
-    // 5) Call model
+    // 5) Model call
     const isHowTo = looksLikeHowTo(message);
     const temperature = isHowTo ? 0.4 : 0.5;
     const r = await client.chat.completions.create({
@@ -347,26 +354,19 @@ You are "Trucks Helper" — a precise, friendly truck expert.
     let reply = r?.choices?.[0]?.message?.content
       || "I couldn't find a clear answer. Tell me your truck year, make and model.";
 
-    // 6) Product-type routing
+    // 6) Product-type routing (only when user shows buying/fitment intent)
     let productType = null;
-    const m = message.toLowerCase();
-    if (isHowTo && /brake|pad|rotor/.test(m)) {
-      productType = "brake pads";
-    } else if (/brake pad|brakes|rotor/.test(m)) {
-      productType = "brake pads";
-    } else if (/tonneau|bed cover/.test(m)) {
-      productType = "tonneau cover";
-    } else if (/lift kit|leveling/.test(m)) {
-      productType = "lift kit";
-    } else if (/tire|all terrain|mud terrain/.test(m)) {
-      productType = "tires";
-    } else if (/tuner|programmer|diablosport|hypertech|hyper tuner/.test(m)) {
-      productType = "tuner";
-    } else if (/(nerf bar|nerf bars|running board|running boards|side step|side steps|step bar|step bars|power ?step|rock slider|rock sliders)/i.test(m)) {
-      productType = "running boards";
+    if (isBuyingOrFitmentIntent(msg)) {
+      if (/brake pad|brakes|rotor/.test(msg))                      productType = "brake pads";
+      else if (/tonneau|bed cover/.test(msg))                      productType = "tonneau cover";
+      else if (/lift kit|leveling/.test(msg))                       productType = "lift kit";
+      else if (/(tire|all terrain|mud terrain)/.test(msg))         productType = "tires";
+      else if (/tuner|programmer|diablosport|hypertech/.test(msg)) productType = "tuner";
+      else if (/(nerf bar|running board|side step|step bar|power ?step|rock slider)/i.test(msg))
+        productType = "running boards";
     }
 
-    // 7) Build queries (reply + user + vehicle)
+    // 7) Build queries
     let queries = extractProductQueries({
       userMsg: message,
       modelReply: reply,
@@ -375,7 +375,7 @@ You are "Trucks Helper" — a precise, friendly truck expert.
       max: 4
     });
 
-    // 7.1 Strong fallback if clearly shopping but no phrases found
+    // Strong fallback if clearly shopping but nothing extracted
     if (!queries.length && (isProductLike(message) || isProductLike(reply))) {
       const veh = [vehicle?.year, vehicle?.make, vehicle?.model].filter(Boolean).join(" ");
       const seedType = productType || "truck accessories";
@@ -384,13 +384,10 @@ You are "Trucks Helper" — a precise, friendly truck expert.
 
     // 8) Link only for product-like intent
     if (queries.length) {
-      // Inline linkification (GEO aware)
       reply = injectAffiliateLinks(
         reply,
         queries.map(q => ({ name: q, url: buildAmazonSearchURL(q, { marketplace }) }))
       );
-
-      // Ensure at least one visible link via small suggestion footer
       const lines = queries.map(q => tinySearchLine(q, marketplace));
       reply = `${reply}
 
@@ -453,7 +450,6 @@ app.get("/widget", (_req, res) => {
     d.innerHTML = '<div class="who">'+role+'</div><div class="bubble">'+html+'</div>';
     $m.appendChild(d); $m.scrollTop = $m.scrollHeight;
     try{ parent.postMessage({type:'embed-size',height:document.body.scrollHeight}, '*'); }catch(e){}
-    // harden any links we just inserted
     const links = d.querySelectorAll('a[href]'); links.forEach(a=>{a.target='_blank'; a.rel='nofollow sponsored noopener';});
   }
 
@@ -478,4 +474,4 @@ app.get("/widget", (_req, res) => {
 });
 
 /* --------------------------------------- */
-app.listen(PORT, () => console.log(`🚀 Truckbot running (chat + memory + guarded links + fallback + GEO US/UK/CA) on :${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Truckbot running (no-nag fitment + guarded links + GEO US/UK/CA) on :${PORT}`));
