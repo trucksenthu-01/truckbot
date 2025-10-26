@@ -422,6 +422,72 @@ As an Amazon Associate, we may earn from qualifying purchases.`;
     });
   }
 });
+// ---- Lightweight embeddable chat widget (served by Render) ----
+app.get("/widget", (_req, res) => {
+  // Keep this all inline so AMP can embed as a single page
+  res.type("html").send(`<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Truck Assistant</title>
+<style>
+  :root{--bg:#0b0f14;--panel:#111923;--border:#213040;--accent:#1f6feb;--text:#e6edf3;--muted:#9bbcff}
+  html,body{margin:0;height:100%} body{background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,Roboto;display:flex;flex-direction:column}
+  header{display:flex;gap:10px;align-items:center;padding:12px;background:var(--panel);border-bottom:1px solid var(--border)}
+  header .logo{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--accent);font-size:16px}
+  #msgs{flex:1;overflow:auto;padding:12px}
+  .msg{margin:8px 0} .who{font-size:11px;opacity:.7;margin-bottom:4px}
+  .bubble{background:#141a22;border:1px solid var(--border);border-radius:12px;padding:10px 12px}
+  .me .bubble{background:rgba(31,111,235,.1);border-color:#2a3b52}
+  form{display:flex;gap:8px;padding:10px;background:var(--panel);border-top:1px solid var(--border)}
+  input{flex:1;border:1px solid #2a3b52;border-radius:10px;background:var(--bg);color:var(--text);padding:10px}
+  button{border:0;border-radius:10px;background:var(--accent);color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}
+  footer{font-size:11px;text-align:center;opacity:.7;padding:6px 10px}
+  a{color:var(--muted);text-decoration:underline}
+</style>
+<header><div class="logo">🚚</div><div><strong>AI Truck Assistant</strong></div></header>
+<main id="msgs"></main>
+<footer>As an Amazon Associate, we may earn from qualifying purchases.</footer>
+<form id="f" autocomplete="off">
+  <input id="q" placeholder="Ask about F-150 lifts, tires, covers…">
+  <button type="submit">Send</button>
+</form>
+<script>
+(() => {
+  const API = "/chat"; // same origin (Render)
+  const $m = document.getElementById('msgs');
+  const $f = document.getElementById('f');
+  const $q = document.getElementById('q');
+  const SESS = (Math.random().toString(36).slice(2)) + Date.now();
+
+  function add(role, html){
+    const d = document.createElement('div'); d.className = 'msg ' + (role==='You'?'me':'ai');
+    d.innerHTML = '<div class="who">'+role+'</div><div class="bubble">'+html+'</div>';
+    $m.appendChild(d); $m.scrollTop = $m.scrollHeight; try{ parent.postMessage({type:'embed-size',height:document.body.scrollHeight}, '*'); }catch(e){}
+  }
+
+  add('AI', 'Hi! I\\'m your AI truck helper. Ask me anything — parts, fitment, or step-by-step how-to.');
+
+  $f.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = $q.value.trim(); if(!text) return;
+    add('You', text); $q.value=''; add('AI', '…typing');
+    try{
+      const r = await fetch(API, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ message: text, session: SESS }) });
+      const data = await r.json();
+      $m.lastChild.remove(); // remove typing
+      const reply = data && data.reply ? data.reply : 'Sorry, I couldn\\'t get a response.';
+      add('AI', reply);
+      // make links safe
+      const a = $m.lastElementChild.querySelectorAll('a'); a.forEach(x=>{x.target='_blank'; x.rel='nofollow sponsored noopener';});
+    }catch(err){
+      $m.lastChild.remove(); add('AI','Server unavailable. Please try again.');
+    }
+  });
+})();
+</script>
+</html>`);
+});
 
 /* --------------------------------------- */
 app.listen(PORT, () => console.log(`🚀 Truckbot running (chat + memory + guarded links + fallback + GEO US/UK/CA) on :${PORT}`));
