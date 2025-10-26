@@ -1,11 +1,11 @@
-// server.js — Chat + memory + guarded Amazon links + ALWAYS-ON FALLBACK + GEO (US/UK/CA)
+// server.js — Chat + memory + guarded links + fallback + GEO (US/UK/CA) + steps/nerf-bars support
 // - Remembers conversation per session (year/make/model, etc.)
 // - Gives how-to steps when asked, then suggests parts
 // - Builds Amazon SEARCH links with your affiliate tag (no product DB needed)
 // - Injects clickable links ONLY for product-like queries
 // - Adds a small "You might consider" block when appropriate
 // - Fallback: if detection finds nothing, builds safe vehicle/product search
-// - GEO: only for US/UK/CA -> .com / .co.uk / .ca (others use AMAZON_MARKETPLACE or .com)
+// - GEO: US/UK/CA -> .com / .co.uk / .ca (others use AMAZON_MARKETPLACE or .com)
 
 import "dotenv/config";
 import express from "express";
@@ -92,8 +92,8 @@ function missingFitment(vehicle) {
 ---------------------------------------- */
 const COUNTRY_TO_TLD_LIMITED = {
   US: "com",
-  GB: "co.uk", // UK / Great Britain
-  UK: "co.uk", // accept UK as well
+  GB: "co.uk", // United Kingdom
+  UK: "co.uk", // accept UK alias too
   CA: "ca",
 };
 
@@ -101,27 +101,25 @@ function normalizeCountry(c) {
   if (!c) return null;
   const s = String(c).trim();
   if (s.length === 2) return s.toUpperCase();
-  // handle "en-US" or "en_US"
-  const m = s.match(/[-_](\w{2})$/);
+  const m = s.match(/[-_](\w{2})$/); // e.g., en-US
   return m ? m[1].toUpperCase() : s.substring(0,2).toUpperCase();
 }
 
 function detectCountryLimited(req, explicitCountry) {
-  // precedence: explicit -> common proxy headers -> accept-language
   const direct = normalizeCountry(explicitCountry);
   if (direct) return direct;
 
   const h = req.headers || {};
-  const cf = normalizeCountry(h["cf-ipcountry"]);           // Cloudflare
+  const cf  = normalizeCountry(h["cf-ipcountry"]);         // Cloudflare
   if (cf) return cf;
-  const ver = normalizeCountry(h["x-vercel-ip-country"]);   // Vercel
+  const ver = normalizeCountry(h["x-vercel-ip-country"]);  // Vercel
   if (ver) return ver;
-  const gen = normalizeCountry(h["x-country-code"]);        // generic proxy/CDN header
+  const gen = normalizeCountry(h["x-country-code"]);       // generic proxy header
   if (gen) return gen;
 
   const al = h["accept-language"];
   if (al) {
-    const first = al.split(",")[0].trim(); // e.g., en-US
+    const first = al.split(",")[0].trim(); // en-US
     const cc = normalizeCountry(first);
     if (cc) return cc;
   }
@@ -129,7 +127,6 @@ function detectCountryLimited(req, explicitCountry) {
 }
 
 function resolveMarketplace(countryLimited) {
-  // Only US/UK/CA are mapped here; otherwise fall back to env default (or .com)
   if (countryLimited && COUNTRY_TO_TLD_LIMITED[countryLimited]) {
     return COUNTRY_TO_TLD_LIMITED[countryLimited];
   }
@@ -165,11 +162,11 @@ function tinySearchLine(q, market) {
 // Basic markdown stripper so your UI sees clean text (no **bold** etc.)
 function stripMarkdownBasic(s = "") {
   return s
-    .replace(/(\*{1,3})([^*]+)\1/g, "$2")      // **bold**, *italic*, ***both***
-    .replace(/`([^`]+)`/g, "$1")               // `code`
-    .replace(/^#+\s*(.+)$/gm, "$1")            // # headings
-    .replace(/!\[[^\]]*\]\([^)]+\)/g, "")      // remove images
-    .replace(/\[[^\]]+\]\([^)]+\)/g, "$&");    // keep markdown links as-is
+    .replace(/(\*{1,3})([^*]+)\1/g, "$2")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^#+\s*(.+)$/gm, "$1")
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, "")
+    .replace(/\[[^\]]+\]\([^)]+\)/g, "$&");
 }
 
 // Token utilities for fuzzy matching
@@ -222,19 +219,22 @@ function injectAffiliateLinks(replyText = "", products = []) {
 }
 
 /* ---------------------------------------
-   Build Amazon search queries from reply/message
-   (STRONGER FILTER: only return queries when we truly see products)
+   Build Amazon search queries from reply/message (STRICT FILTER)
 ---------------------------------------- */
 const BRAND_WHITELIST = [
+  // tonneau / general
   "BAKFlip","UnderCover","TruXedo","Extang","Retrax","Gator","Rough Country",
   "Bilstein","DiabloSport","Hypertech","Motorcraft","Power Stop","WeatherTech",
   "Tyger","Nitto","BFGoodrich","Falken","K&N","Borla","Flowmaster","Gator EFX",
   "ArmorFlex","MX4","Ultra Flex","Lo Pro","Sentry CT","Solid Fold","Husky",
-  "FOX","Rancho","Monroe","Moog","ACDelco","Dorman","Bosch","NGK","Mopar"
+  "FOX","Rancho","Monroe","Moog","ACDelco","Dorman","Bosch","NGK","Mopar",
+  // NEW: steps / nerf bars / running boards
+  "AMP Research","N-Fab","NFab","Westin","Go Rhino","Ionic","Luverne","ARIES","Dee Zee","Tyger Auto"
 ];
 
 // Shopping-ish nouns to gate generic queries
-const PRODUCT_TERMS = /(cover|tonneau|lift kit|leveling kit|tire|wheel|brake|pad|rotor|shock|strut|bumper|intake|exhaust|tuner|programmer|filter|floor mat|bed liner|rack|light|headlight|taillight|coilover|spring|winch|hitch|oil|battery)/i;
+const PRODUCT_TERMS =
+  /(cover|tonneau|lift kit|leveling kit|tire|wheel|brake|pad|rotor|shock|strut|bumper|intake|exhaust|tuner|programmer|filter|floor mat|bed liner|rack|light|headlight|taillight|coilover|spring|winch|hitch|oil|battery|nerf bar|nerf bars|running board|running boards|side step|side steps|step bar|step bars|powerstep|power step|power steps|rock slider|rock sliders)/i;
 
 function extractProductQueries({ userMsg, modelReply, vehicle, productType, max = 3 }) {
   const out = [];
@@ -353,7 +353,7 @@ You are "Trucks Helper" — a precise, friendly truck expert.
     let reply = r?.choices?.[0]?.message?.content
       || "I couldn't find a clear answer. Tell me your truck year, make and model.";
 
-    // 6) Product-type routing for targeted queries
+    // 6) Product-type routing for targeted queries (expanded)
     let productType = null;
     const m = message.toLowerCase();
     if (isHowTo && /brake|pad|rotor/.test(m)) {
@@ -368,6 +368,8 @@ You are "Trucks Helper" — a precise, friendly truck expert.
       productType = "tires";
     } else if (/tuner|programmer|diablosport|hypertech|hyper tuner/.test(m)) {
       productType = "tuner";
+    } else if (/(nerf bar|nerf bars|running board|running boards|side step|side steps|step bar|step bars|powerstep|power step|power steps|rock slider|rock sliders)/i.test(m)) {
+      productType = "running boards"; // umbrella term that works well for search
     }
     // Extend mappings as needed…
 
@@ -416,7 +418,7 @@ As an Amazon Associate, we may earn from qualifying purchases.`;
   } catch (e) {
     console.error("[/chat] error", e?.response?.data || e.message || e);
     return res.json({
-      reply: "I’m having trouble reaching the AI right now. Meanwhile, if you share your truck year/make/model, I’ll fetch exact parts that fit."
+      reply: "I’m having trouble reaching the AI right now. Meanwhile, if you share your truck year, make, and model, I’ll fetch exact parts that fit."
     });
   }
 });
