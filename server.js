@@ -1,9 +1,11 @@
-// server.js — Chat + memory + Amazon search links (guarded)
+// server.js — Chat + memory + guarded Amazon search links + GEO MARKETPLACE
 // - Remembers conversation per session (year/make/model, etc.)
 // - Gives how-to steps when asked, then suggests parts
-// - Builds Amazon SEARCH links with your affiliate tag (no product DB needed)
+// - Builds Amazon SEARCH links with your affiliate tag
 // - Injects clickable links ONLY when the query is truly product-like
 // - Adds a small "You might consider" block when appropriate
+// - NEW: Geo-aware marketplace (.com / .in / .ca / .co.uk …) from headers or Accept-Language,
+//        with optional override via request body { country, market }
 
 import "dotenv/config";
 import express from "express";
@@ -87,7 +89,57 @@ function missingFitment(vehicle) {
 }
 
 /* ---------------------------------------
-   Amazon search links (affiliate)
+   GEO: country -> Amazon marketplace TLD
+---------------------------------------- */
+const COUNTRY_TO_TLD = {
+  US: "com",  CA: "ca",   MX: "com.mx",
+  GB: "co.uk", IE: "co.uk",
+  AU: "com.au",
+  DE: "de",   FR: "fr",   IT: "it",   ES: "es",   NL: "nl",  SE: "se",  PL: "pl",
+  JP: "co.jp",
+  IN: "in",
+  AE: "ae",   SG: "sg",   BR: "com.br",
+};
+
+function normalizeCountry(c) {
+  if (!c) return null;
+  const s = String(c).trim();
+  if (s.length === 2) return s.toUpperCase();
+  // if "en-US" or "en_US"
+  const m = s.match(/[-_](\w{2})$/);
+  return m ? m[1].toUpperCase() : s.substring(0,2).toUpperCase();
+}
+
+function detectCountry(req, explicitCountry) {
+  // precedence: explicit -> common proxy headers -> accept-language
+  const direct = normalizeCountry(explicitCountry);
+  if (direct) return direct;
+
+  const h = req.headers || {};
+  const cf = normalizeCountry(h["cf-ipcountry"]);           // Cloudflare
+  if (cf) return cf;
+  const ver = normalizeCountry(h["x-vercel-ip-country"]);   // Vercel
+  if (ver) return ver;
+  const gen = normalizeCountry(h["x-country-code"]);        // generic proxy
+  if (gen) return gen;
+
+  const al = h["accept-language"];
+  if (al) {
+    // take first language block, then region if present
+    const first = al.split(",")[0].trim(); // e.g., en-US
+    const cc = normalizeCountry(first);
+    if (cc) return cc;
+  }
+  return null;
+}
+
+function countryToMarketplace(country) {
+  if (!country) return process.env.AMAZON_MARKETPLACE || "com";
+  return COUNTRY_TO_TLD[country] || (process.env.AMAZON_MARKETPLACE || "com");
+}
+
+/* ---------------------------------------
+   Amazon search links (affiliate) + GEO
 ---------------------------------------- */
 function amazonDomainFromCC(cc="com") {
   const tld = (cc || "com").toLowerCase();
@@ -105,33 +157,29 @@ function buildAmazonSearchURL(query, { tag, marketplace } = {}) {
 /* ---------------------------------------
    Tiny suggestion line (footer block)
 ---------------------------------------- */
-function tinySearchLine(q) {
-  const url = buildAmazonSearchURL(q);
+function tinySearchLine(q, market) {
+  const url = buildAmazonSearchURL(q, { marketplace: market });
   return `• ${q} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
 /* ========= Inline link helpers (fuzzy + markdown strip) ========= */
-
-// Basic markdown stripper so your UI sees clean text (no **bold** etc.)
 function stripMarkdownBasic(s = "") {
   return s
-    .replace(/(\*{1,3})([^*]+)\1/g, "$2")      // **bold**, *italic*, ***both***
-    .replace(/`([^`]+)`/g, "$1")               // `code`
-    .replace(/^#+\s*(.+)$/gm, "$1")            // # headings
-    .replace(/!\[[^\]]*\]\([^)]+\)/g, "")      // remove images
-    .replace(/\[[^\]]+\]\([^)]+\)/g, "$&");    // keep markdown links as-is
+    .replace(/(\*{1,3})([^*]+)\1/g, "$2")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^#+\s*(.+)$/gm, "$1")
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, "")
+    .replace(/\[[^\]]+\]\([^)]+\)/g, "$&");
 }
 
-// Token utilities for fuzzy matching
 const _STOP = new Set(["the","a","an","for","to","of","on","with","and","or","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great"]);
 const _norm = s => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 const _toks = s => _norm(s).split(" ").filter(t => t && !_STOP.has(t));
 
-// Build regex matching main tokens in order (like "bakflip mx4")
 function buildOrderedTokenRegex(name) {
   const ts = _toks(name);
   if (!ts.length) return null;
-  const chosen = ts.slice(0, Math.min(3, ts.length)); // 2–3 core tokens
+  const chosen = ts.slice(0, Math.min(3, ts.length));
   const pattern = chosen.map(t => `(${t})`).join(`\\s+`);
   return new RegExp(`\\b${pattern}\\b`, "gi");
 }
@@ -149,7 +197,6 @@ function injectAffiliateLinks(replyText = "", products = []) {
     const full = p?.name;
     if (!url || !full) continue;
 
-    // 1) token-ordered fuzzy match (brand + model)
     const tokenRe = buildOrderedTokenRegex(full);
     if (tokenRe && tokenRe.test(out)) {
       out = out.replace(tokenRe, (m) =>
@@ -157,8 +204,6 @@ function injectAffiliateLinks(replyText = "", products = []) {
       );
       continue;
     }
-
-    // 2) fallback: exact full-name (case-insensitive), word-bounded
     const escaped = full.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const exactRe = new RegExp(`\\b(${escaped})\\b`, "gi");
     if (exactRe.test(out)) {
@@ -172,8 +217,7 @@ function injectAffiliateLinks(replyText = "", products = []) {
 }
 
 /* ---------------------------------------
-   Build Amazon search queries from reply/message
-   (STRONGER FILTER: only return queries when we truly see products)
+   Build Amazon search queries from reply/message (STRICT FILTER)
 ---------------------------------------- */
 const BRAND_WHITELIST = [
   "BAKFlip","UnderCover","TruXedo","Extang","Retrax","Gator","Rough Country",
@@ -183,31 +227,26 @@ const BRAND_WHITELIST = [
   "FOX","Rancho","Monroe","Moog","ACDelco","Dorman","Bosch","NGK","Mopar"
 ];
 
-// Shopping-ish nouns to gate generic queries
 const PRODUCT_TERMS = /(cover|tonneau|lift kit|leveling kit|tire|wheel|brake|pad|rotor|shock|strut|bumper|intake|exhaust|tuner|programmer|filter|floor mat|bed liner|rack|light|headlight|taillight|coilover|spring|winch|hitch|oil|battery)/i;
 
 function extractProductQueries({ userMsg, modelReply, vehicle, productType, max = 3 }) {
   const out = [];
 
-  // 1) If we confidently detected a productType, build vehicle-scoped searches
   if (productType) {
     const veh = [vehicle?.year, vehicle?.make, vehicle?.model].filter(Boolean).join(" ");
     if (veh) out.push(`${veh} ${productType}`);
     out.push(`${productType} ${vehicle?.make || ""} ${vehicle?.model || ""}`.trim());
   }
 
-  // 2) Scan the model reply for brand phrases (only from whitelist)
   const phrases = (modelReply || "").match(/\b([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z0-9\.\-]+){0,3})\b/g) || [];
   phrases.forEach(s => {
     if (BRAND_WHITELIST.some(w => s.toLowerCase().includes(w.toLowerCase()))) out.push(s);
   });
 
-  // 3) DO NOT fall back to the raw user message unless it clearly looks like shopping
   if (!out.length && userMsg && PRODUCT_TERMS.test(userMsg)) {
     out.push(userMsg);
   }
 
-  // de-dup + trim + top-N
   const seen = new Set();
   const deduped = [];
   for (const s of out) {
@@ -224,15 +263,21 @@ function extractProductQueries({ userMsg, modelReply, vehicle, productType, max 
    Diagnostics
 ---------------------------------------- */
 app.get("/health", (_req,res)=>res.send("ok"));
-app.get("/diag", (_req,res)=>res.json({
-  ok:true,
-  model: MODEL,
-  has_api_key: !!process.env.OPENAI_API_KEY,
-  allowed_origins: allowed,
-  sessions: SESSIONS.size,
-  affiliate_tag: process.env.AFFILIATE_TAG || null,
-  amazon_marketplace: process.env.AMAZON_MARKETPLACE || "com"
-}));
+app.get("/diag", (req,res)=> {
+  const country = detectCountry(req);
+  const market  = countryToMarketplace(country);
+  res.json({
+    ok:true,
+    model: MODEL,
+    has_api_key: !!process.env.OPENAI_API_KEY,
+    allowed_origins: allowed,
+    sessions: SESSIONS.size,
+    affiliate_tag: process.env.AFFILIATE_TAG || null,
+    default_marketplace: process.env.AMAZON_MARKETPLACE || "com",
+    detected_country: country,
+    resolved_marketplace: market
+  });
+});
 
 // Quick UI test: if this isn't clickable in your chat, switch to innerHTML in the widget
 app.get("/debug/anchor", (_req,res) => {
@@ -244,10 +289,14 @@ app.get("/debug/anchor", (_req,res) => {
 ---------------------------------------- */
 app.post("/chat", async (req, res) => {
   try {
-    const { message, session } = req.body || {};
+    const { message, session, country: bodyCountry, market: bodyMarket } = req.body || {};
     if (!message || typeof message !== "string") {
       return res.status(400).json({ reply: "Missing 'message' (string) in body." });
     }
+
+    // GEO resolve: body override -> headers -> env default
+    const country = normalizeCountry(bodyCountry) || detectCountry(req);
+    const market  = (bodyMarket || countryToMarketplace(country));
 
     const sessionId = (session || "visitor").toString().slice(0, 60);
     const sess = getSession(sessionId);
@@ -322,14 +371,14 @@ You are "Trucks Helper" — a precise, friendly truck expert.
 
     // 8) ONLY link when we actually found product-like queries
     if (queries.length) {
-      // Inline hyperlinks in MAIN TEXT to Amazon search with tag
+      // Inline hyperlinks in MAIN TEXT to Amazon search with GEO market + tag
       reply = injectAffiliateLinks(
         reply,
-        queries.map(q => ({ name: q, url: buildAmazonSearchURL(q) }))
+        queries.map(q => ({ name: q, url: buildAmazonSearchURL(q, { marketplace: market }) }))
       );
 
-      // 9) Append a small suggestion block
-      const lines = queries.map(tinySearchLine);
+      // 9) Append a small suggestion block (also GEO-aware)
+      const lines = queries.map(q => tinySearchLine(q, market));
       reply = `${reply}
 
 You might consider:
@@ -351,4 +400,4 @@ As an Amazon Associate, we may earn from qualifying purchases.`;
 });
 
 /* --------------------------------------- */
-app.listen(PORT, () => console.log(`🚀 Truckbot running (chat + memory + guarded Amazon links) on :${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Truckbot running (chat + memory + geo Amazon links) on :${PORT}`));
