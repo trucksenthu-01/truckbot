@@ -1,11 +1,10 @@
-// server.js — Chat + memory + guarded links + fallback + GEO (US/UK/CA)
-// - Remembers conversation per session (year/make/model, etc.)
-// - Answers general questions WITHOUT demanding fitment
-// - Asks for fitment only for clear buying/fitment intent (cooldowned)
-// - Builds Amazon SEARCH links with your affiliate tag
-// - Injects clickable links ONLY for product-like queries
-// - Fallback search when needed
-// - GEO: US/UK/CA -> .com / .co.uk / .ca (others use AMAZON_MARKETPLACE or .com)
+// server.js — Conversational follow-ups + no-nag fitment + guarded links + GEO
+// - Natural answers first; smart follow-ups next (like ChatGPT)
+// - How-to -> offer parts help; “Yes” -> (collect fitment if needed) -> recommend
+// - Session memory: year/make/model/etc.
+// - Amazon SEARCH links with affiliate + GEO (.com/.co.uk/.ca)
+// - Links only for product-like intent; tiny “You might consider” footer
+// - Cooldowns prevent repeat askbacks
 
 import "dotenv/config";
 import express from "express";
@@ -38,10 +37,11 @@ const MODEL  = process.env.MODEL || "gpt-4o-mini";
 const PORT   = process.env.PORT || 3000;
 
 /* ---------------------------------------
-   In-memory session store (simple)
+   In-memory session store
 ---------------------------------------- */
-const SESSIONS = new Map(); // sessionId -> { history: Message[], vehicle: {...}, _asked_fitment_at?: ts }
-const MAX_TURNS = 12;
+// session: { history:[], vehicle:{}, _asked_fitment_at, _pending_offer:{type, at}, _awaiting_fitment_for?:string }
+const SESSIONS = new Map();
+const MAX_TURNS = 16;
 
 function getSession(sessionId) {
   if (!SESSIONS.has(sessionId)) {
@@ -57,15 +57,14 @@ function pushHistory(sess, role, content) {
 }
 
 /* ---------------------------------------
-   Utilities: intent, vehicle memory
+   Intent helpers
 ---------------------------------------- */
-const HOWTO_KEYWORDS = [
-  "how to","how do i","procedure","steps","install","replace","change","fix","tutorial"
-];
+const HOWTO_KEYWORDS = ["how to","how do i","procedure","steps","install","replace","change","fix","tutorial"];
 function looksLikeHowTo(text="") {
   const t = text.toLowerCase();
   return HOWTO_KEYWORDS.some(k => t.includes(k));
 }
+
 function mergeVehicleMemory(sess, fromIntent = {}) {
   const v = sess.vehicle || {};
   const merged = {
@@ -84,128 +83,17 @@ function missingFitment(vehicle) {
   if (!vehicle.year)  missing.push("year");
   if (!vehicle.make)  missing.push("make");
   if (!vehicle.model) missing.push("model");
-  return missing; // bed/trim optional
+  return missing;
 }
 
-/* ---------------------------------------
-   GEO (US/UK/CA only) -> marketplace TLD
----------------------------------------- */
-const COUNTRY_TO_TLD_LIMITED = { US:"com", GB:"co.uk", UK:"co.uk", CA:"ca" };
-
-function normalizeCountry(c) {
-  if (!c) return null;
-  const s = String(c).trim();
-  if (s.length === 2) return s.toUpperCase();
-  const m = s.match(/[-_](\w{2})$/); // e.g., en-US
-  return m ? m[1].toUpperCase() : s.substring(0,2).toUpperCase();
-}
-function detectCountryLimited(req, explicitCountry) {
-  const direct = normalizeCountry(explicitCountry);
-  if (direct) return direct;
-  const h = req.headers || {};
-  const cf  = normalizeCountry(h["cf-ipcountry"]);
-  if (cf) return cf;
-  const ver = normalizeCountry(h["x-vercel-ip-country"]);
-  if (ver) return ver;
-  const gen = normalizeCountry(h["x-country-code"]);
-  if (gen) return gen;
-  const al = h["accept-language"];
-  if (al) {
-    const first = al.split(",")[0].trim(); // en-US
-    const cc = normalizeCountry(first);
-    if (cc) return cc;
-  }
-  return null;
-}
-function resolveMarketplace(countryLimited) {
-  if (countryLimited && COUNTRY_TO_TLD_LIMITED[countryLimited]) {
-    return COUNTRY_TO_TLD_LIMITED[countryLimited];
-  }
-  return process.env.AMAZON_MARKETPLACE || "com";
-}
-
-/* ---------------------------------------
-   Amazon search links (affiliate)
----------------------------------------- */
-function amazonDomainFromCC(cc="com") {
-  const tld = (cc || "com").toLowerCase();
-  return `https://www.amazon.${tld}`;
-}
-function buildAmazonSearchURL(query, { tag, marketplace } = {}) {
-  const base = amazonDomainFromCC(marketplace || process.env.AMAZON_MARKETPLACE || "com");
-  const params = new URLSearchParams();
-  params.set("k", query);
-  const assoc = tag || process.env.AFFILIATE_TAG;
-  if (assoc) params.set("tag", assoc);
-  return `${base}/s?${params.toString()}`;
-}
-
-/* ---------------------------------------
-   Tiny suggestion line (footer block)
----------------------------------------- */
-function tinySearchLine(q, market) {
-  const url = buildAmazonSearchURL(q, { marketplace: market });
-  return `• ${q} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
-}
-
-/* ========= Inline link helpers (fuzzy + markdown strip) ========= */
-function stripMarkdownBasic(s = "") {
-  return s
-    .replace(/(\*{1,3})([^*]+)\1/g, "$2")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/^#+\s*(.+)$/gm, "$1")
-    .replace(/!\[[^\]]*\]\([^)]+\)/g, "")
-    .replace(/\[[^\]]+\]\([^)]+\)/g, "$&");
-}
-const _STOP = new Set(["the","a","an","for","to","of","on","with","and","or","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great","kit","pads","brakes"]);
-const _norm = s => (s || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-const _toks = s => _norm(s).split(" ").filter(t => t && !_STOP.has(t));
-function buildOrderedTokenRegex(name) {
-  const ts = _toks(name);
-  if (!ts.length) return null;
-  const chosen = ts.slice(0, Math.min(3, ts.length));
-  const pattern = chosen.map(t => `(${t})`).join(`\\s+`);
-  return new RegExp(`\\b${pattern}\\b`, "gi");
-}
-function injectAffiliateLinks(replyText = "", products = []) {
-  if (!replyText || !Array.isArray(products) || !products.length) return replyText;
-  let out = stripMarkdownBasic(replyText);
-  for (const p of products) {
-    const url = p?.url;
-    const full = p?.name;
-    if (!url || !full) continue;
-    const tokenRe = buildOrderedTokenRegex(full);
-    if (tokenRe && tokenRe.test(out)) {
-      out = out.replace(tokenRe, (m) =>
-        `<a href="${url}" target="_blank" rel="nofollow sponsored noopener">${m}</a>`
-      );
-      continue;
-    }
-    const escaped = full.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const exactRe = new RegExp(`\\b(${escaped})\\b`, "gi");
-    if (exactRe.test(out)) {
-      out = out.replace(
-        exactRe,
-        `<a href="${url}" target="_blank" rel="nofollow sponsored noopener">$1</a>`
-      );
-    }
-  }
-  return out;
-}
-
-/* ---------------------------------------
-   Product detection + query extraction
----------------------------------------- */
 const BRAND_WHITELIST = [
-  // tonneau / general
   "AMP Research","PowerStep","BAKFlip","UnderCover","TruXedo","Extang","Retrax",
   "Gator","Rough Country","Bilstein","DiabloSport","Hypertech","Motorcraft",
   "Power Stop","WeatherTech","Tyger","Nitto","BFGoodrich","Falken","K&N",
   "Borla","Flowmaster","Gator EFX","ArmorFlex","MX4","Ultra Flex","Lo Pro",
   "Sentry CT","Solid Fold","Husky","FOX","Rancho","Monroe","Moog","ACDelco",
-  "Dorman","Bosch","NGK","Mopar",
-  // steps / nerf bars / running boards
-  "N-Fab","NFab","Westin","Go Rhino","Ionic","Luverne","ARIES","Dee Zee","Tyger Auto"
+  "Dorman","Bosch","NGK","Mopar","N-Fab","NFab","Westin","Go Rhino","Ionic",
+  "Luverne","ARIES","Dee Zee","Tyger Auto"
 ];
 
 const PRODUCT_TERMS =
@@ -215,54 +103,106 @@ function isProductLike(text = "") {
   if (!text) return false;
   if (PRODUCT_TERMS.test(text)) return true;
   const lower = text.toLowerCase();
-  return BRAND_WHITELIST.some(b => {
-    const esc = b.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`\\b${esc}\\b`, "i").test(lower);
-  });
+  return BRAND_WHITELIST.some(b => new RegExp(`\\b${b.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}\\b`,"i").test(lower));
 }
-
-/* ---------- New: intent gates for fitment ask ---------- */
 function isGeneralInfoIntent(s = "") {
-  return /(issue|issues|problem|symptom|noise|vibration|cause|risk|signs|maintenance|service|interval|torque|how to|steps|procedure|install|remove|replace|why|what|explain|guide|tips|troubleshoot|diagnose|difference|pros|cons|lifespan|wear)/i.test(s);
+  return /(issue|issues|problem|symptom|noise|vibration|cause|risk|signs|maintenance|service|interval|torque|why|what|difference|pros|cons|lifespan|wear|troubleshoot|diagnose|guide|tips)/i.test(s);
 }
 function isBuyingOrFitmentIntent(s = "") {
-  return /(fit|fitment|compatible|which|exact|part|sku|model number|buy|price|link|recommend|best|options|where to buy)/i.test(s);
+  return /(fit|fitment|compatible|which|exact|part|sku|model number|buy|price|link|recommend|best|options|where to buy|get|order)/i.test(s);
+}
+function isAffirmation(s=""){ return /\b(yes|yeah|yup|sure|ok|okay|please|do it|go ahead|why not)\b/i.test(s); }
+function isNegation(s=""){ return /\b(no|nope|not now|later|maybe later|skip|cancel)\b/i.test(s); }
+
+/* ---------------------------------------
+   GEO helpers
+---------------------------------------- */
+const COUNTRY_TO_TLD_LIMITED = { US:"com", GB:"co.uk", UK:"co.uk", CA:"ca" };
+function normalizeCountry(c) {
+  if (!c) return null;
+  const s = String(c).trim();
+  if (s.length === 2) return s.toUpperCase();
+  const m = s.match(/[-_](\w{2})$/);
+  return m ? m[1].toUpperCase() : s.substring(0,2).toUpperCase();
+}
+function detectCountryLimited(req, explicitCountry) {
+  const direct = normalizeCountry(explicitCountry);
+  if (direct) return direct;
+  const h = req.headers || {};
+  return normalizeCountry(h["cf-ipcountry"])
+      || normalizeCountry(h["x-vercel-ip-country"])
+      || normalizeCountry(h["x-country-code"])
+      || (()=>{ const al=h["accept-language"]; if(!al) return null; return normalizeCountry(al.split(",")[0]); })()
+      || null;
+}
+function resolveMarketplace(countryLimited) {
+  if (countryLimited && COUNTRY_TO_TLD_LIMITED[countryLimited]) return COUNTRY_TO_TLD_LIMITED[countryLimited];
+  return process.env.AMAZON_MARKETPLACE || "com";
 }
 
-// Extract queries from reply + user + vehicle + productType
+/* ---------------------------------------
+   Amazon link builders
+---------------------------------------- */
+function amazonDomainFromCC(cc="com") { return `https://www.amazon.${(cc||"com").toLowerCase()}`; }
+function buildAmazonSearchURL(query, { tag, marketplace } = {}) {
+  const base = amazonDomainFromCC(marketplace || process.env.AMAZON_MARKETPLACE || "com");
+  const params = new URLSearchParams();
+  params.set("k", query);
+  const assoc = tag || process.env.AFFILIATE_TAG;
+  if (assoc) params.set("tag", assoc);
+  return `${base}/s?${params.toString()}`;
+}
+function tinySearchLine(q, market) {
+  const url = buildAmazonSearchURL(q, { marketplace: market });
+  return `• ${q} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
+}
+
+/* -------- inline link injection (fuzzy) -------- */
+function stripMarkdownBasic(s=""){
+  return s.replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1").replace(/^#+\s*(.+)$/gm,"$1")
+          .replace(/!\[[^\]]*\]\([^)]+\)/g,"").replace(/\[[^\]]+\]\([^)]+\)/g,"$&");
+}
+const _STOP = new Set(["the","a","an","for","to","of","on","with","and","or","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great","kit","pads","brakes"]);
+const _norm = s => (s||"").toLowerCase().replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim();
+const _toks = s => _norm(s).split(" ").filter(t => t && !_STOP.has(t));
+function buildOrderedTokenRegex(name){
+  const ts = _toks(name); if(!ts.length) return null;
+  const chosen = ts.slice(0, Math.min(3, ts.length));
+  return new RegExp(`\\b${chosen.map(t=>`(${t})`).join(`\\s+`)}\\b`,"gi");
+}
+function injectAffiliateLinks(replyText="", products=[]){
+  if (!replyText || !Array.isArray(products) || !products.length) return replyText;
+  let out = stripMarkdownBasic(replyText);
+  for (const p of products) {
+    const url = p?.url, full = p?.name; if(!url || !full) continue;
+    const tokenRe = buildOrderedTokenRegex(full);
+    if (tokenRe && tokenRe.test(out)) {
+      out = out.replace(tokenRe, m => `<a href="${url}" target="_blank" rel="nofollow sponsored noopener">${m}</a>`);
+      continue;
+    }
+    const esc = full.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+    const exact = new RegExp(`\\b(${esc})\\b`,"gi");
+    if (exact.test(out)) out = out.replace(exact, `<a href="${url}" target="_blank" rel="nofollow sponsored noopener">$1</a>`);
+  }
+  return out;
+}
+
+/* ---------------------------------------
+   Build product queries
+---------------------------------------- */
 function extractProductQueries({ userMsg, modelReply, vehicle, productType, max = 4 }) {
   const out = [];
-
-  // vehicle-scoped seed if we know type
   if (productType) {
     const veh = [vehicle?.year, vehicle?.make, vehicle?.model].filter(Boolean).join(" ");
     if (veh) out.push(`${veh} ${productType}`);
   }
-
-  // brand phrases in the model reply
-  const candidatesReply = (modelReply || "").match(/\b([A-Z][a-zA-Z]+(?:\s[A-Z0-9][a-zA-Z0-9\.\-]+){0,3})\b/g) || [];
-  for (const c of candidatesReply) {
-    if (BRAND_WHITELIST.some(b => c.toLowerCase().includes(b.toLowerCase()))) out.push(c);
-  }
-
-  // also scan user message for brands
-  const candidatesUser = (userMsg || "").match(/\b([A-Z][a-zA-Z]+(?:\s[A-Z0-9][a-zA-Z0-9\.\-]+){0,3})\b/g) || [];
-  for (const c of candidatesUser) {
-    if (BRAND_WHITELIST.some(b => c.toLowerCase().includes(b.toLowerCase()))) out.push(c);
-  }
-
-  // last resort: if it clearly looks producty, include the raw user message
+  const cap = /\b([A-Z][a-zA-Z]+(?:\s[A-Z0-9][a-zA-Z0-9\.\-]+){0,3})\b/g;
+  for (const s of (modelReply || "").match(cap) || []) if (BRAND_WHITELIST.some(b => s.toLowerCase().includes(b.toLowerCase()))) out.push(s);
+  for (const s of (userMsg   || "").match(cap) || []) if (BRAND_WHITELIST.some(b => s.toLowerCase().includes(b.toLowerCase()))) out.push(s);
   if (!out.length && isProductLike(userMsg || "")) out.push(userMsg.trim());
-
-  // de-dupe + cap
-  const seen = new Set(); const deduped = [];
-  for (const s of out) {
-    const k = s.toLowerCase().trim();
-    if (!k || seen.has(k)) continue;
-    seen.add(k); deduped.push(s.trim());
-    if (deduped.length >= max) break;
-  }
-  return deduped;
+  const seen=new Set(), ded=[];
+  for (const s of out){ const k=s.toLowerCase().trim(); if(!k||seen.has(k)) continue; seen.add(k); ded.push(s.trim()); if(ded.length>=max) break; }
+  return ded;
 }
 
 /* ---------------------------------------
@@ -273,20 +213,14 @@ app.get("/diag", (req,res)=> {
   const country = detectCountryLimited(req);
   const marketplace = resolveMarketplace(country);
   res.json({
-    ok:true,
-    model: MODEL,
-    has_api_key: !!process.env.OPENAI_API_KEY,
-    allowed_origins: allowed,
-    sessions: SESSIONS.size,
+    ok:true, model: MODEL, has_api_key: !!process.env.OPENAI_API_KEY,
+    allowed_origins: allowed, sessions: SESSIONS.size,
     affiliate_tag: process.env.AFFILIATE_TAG || null,
     default_marketplace: process.env.AMAZON_MARKETPLACE || "com",
-    detected_country: country,
-    resolved_marketplace: marketplace
+    detected_country: country, resolved_marketplace: marketplace
   });
 });
-app.get("/debug/anchor", (_req,res) => {
-  res.send('Test anchor → <a href="https://amazon.com" target="_blank" rel="nofollow">Amazon</a>');
-});
+app.get("/debug/anchor", (_req,res) => res.send('Test anchor → <a href="https://amazon.com" target="_blank" rel="nofollow">Amazon</a>'));
 
 /* ---------------------------------------
    Chat endpoint
@@ -294,58 +228,85 @@ app.get("/debug/anchor", (_req,res) => {
 app.post("/chat", async (req, res) => {
   try {
     const { message, session, country: bodyCountry, market: bodyMarket } = req.body || {};
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ reply: "Missing 'message' (string) in body." });
-    }
+    if (!message || typeof message !== "string") return res.status(400).json({ reply: "Missing 'message' (string) in body." });
 
-    // GEO resolve
     const country = normalizeCountry(bodyCountry) || detectCountryLimited(req);
     const marketplace = (bodyMarket || resolveMarketplace(country));
-
     const sessionId = (session || "visitor").toString().slice(0, 60);
     const sess = getSession(sessionId);
 
-    // 1) Update memory with the user's message
+    // Track history + vehicle
     pushHistory(sess, "user", message);
-
-    // 2) Extract/update vehicle profile
     const parsed = extractIntent(message || "");
     const vehicle = mergeVehicleMemory(sess, parsed);
-
-    // 3) Fitment askback ONLY for clear buying/fitment intent + producty message
-    const msg = (message || "").toLowerCase();
     const miss = missingFitment(vehicle);
-    const needFitment = isBuyingOrFitmentIntent(msg) && isProductLike(msg) && miss.length >= 2;
-    const nowTs = Date.now();
-    const askedRecently = sess._asked_fitment_at && (nowTs - sess._asked_fitment_at < 3 * 60 * 1000); // 3 min cooldown
+    const msg = (message || "").toLowerCase();
 
-    if (needFitment && !askedRecently) {
-      const ask = `To recommend exact parts, what is your truck's ${miss.join(" & ")}? (Example: 2019 Ford F-150 5.5 ft bed XLT)`;
-      sess._asked_fitment_at = nowTs;
-      pushHistory(sess, "assistant", ask);
-      return res.json({ reply: ask });
+    /* ---------- Follow-up flow handling ---------- */
+
+    // If user is replying to our pending offer:
+    if (sess._pending_offer) {
+      const pType = sess._pending_offer.type;
+      if (isNegation(msg)) {
+        sess._pending_offer = null;
+        pushHistory(sess, "assistant", "No problem. If you change your mind, just say “recommend pads” and I’ll fetch options.");
+        return res.json({ reply: "No problem. If you change your mind, just say “recommend pads” and I’ll fetch options." });
+      }
+      if (isAffirmation(msg)) {
+        // If we need fitment, ask once and set awaiting state
+        if (miss.length >= 2) {
+          const ask = `Great — I’ll pull ${pType} that fit perfectly. What is your truck's ${miss.join(" & ")}? (Example: 2019 Ford F-150 5.5 ft bed XLT)`;
+          sess._awaiting_fitment_for = pType;
+          sess._pending_offer = null;
+          sess._asked_fitment_at = Date.now();
+          pushHistory(sess, "assistant", ask);
+          return res.json({ reply: ask });
+        }
+        // If fitment is known, jump straight to recommendations
+        // (fall through to recommendation flow below)
+      }
+      // Otherwise, continue to normal handling.
+      sess._pending_offer = null;
     }
 
-    // 4) Prompt + history (encourage answering general info without fitment)
+    // If we’re awaiting fitment for a specific type and the user supplied details this turn,
+    // re-merge vehicle (already done) and proceed to recommendations when enough is known.
+    let forceRecommendType = null;
+    if (sess._awaiting_fitment_for) {
+      if (miss.length >= 2) {
+        // Still missing; gently re-ask only if not just asked < 3 min
+        const askedRecently = sess._asked_fitment_at && (Date.now() - sess._asked_fitment_at < 3*60*1000);
+        if (!askedRecently) {
+          const ask = `To recommend exact parts, I still need your truck's ${miss.join(" & ")}. (Example: 2019 Ford F-150 5.5 ft bed XLT)`;
+          sess._asked_fitment_at = Date.now();
+          pushHistory(sess, "assistant", ask);
+          return res.json({ reply: ask });
+        }
+      } else {
+        forceRecommendType = sess._awaiting_fitment_for;
+        sess._awaiting_fitment_for = null;
+      }
+    }
+
+    /* ---------- Compose model prompt ---------- */
+
     const systemPrompt = `
-You are "Trucks Helper" — a precise, friendly truck expert.
+You are "Trucks Helper" — precise, friendly, and proactive.
 
-Core behavior:
-- If the user asks for general information (symptoms, causes, differences, maintenance, how-to steps, torque ranges, etc.), ANSWER DIRECTLY even if vehicle details are unknown. Provide applicable ranges and note variations by year/trim if relevant.
-- Use the stored vehicle profile when giving fitment or buying recommendations.
-- Only ask for missing vehicle details when the user clearly wants exact parts, fitment, or buying guidance. Ask at most once per thread; don't repeat unless the user shows buying intent again.
-
-How-to:
-- For "how to" requests, give clear, safety-first steps. If appropriate, suggest categories of parts and note which vehicle details affect selection.
-
-Links:
-- Do not paste URLs; the server injects shopping links afterward.
+Rules:
+- For general info (symptoms, causes, differences, maintenance, torque, etc.), answer directly even if vehicle details are unknown. If specs vary by year/trim, note the variation succinctly.
+- For how-to, give clear safety-first steps, typical tools, and pro tips.
+- For buying/fitment intent, use stored vehicle details if present. If critical details are missing, ask a single concise follow-up.
+- Keep responses compact and useful (no long generic lists).
+- Don’t paste URLs; the server will add shopping links if needed.
+- When you finish a how-to or a product-ish answer, include a short, natural follow-up suggestion in one friendly sentence (we may ask it as a separate bubble).
 `;
+
     const base = [{ role: "system", content: systemPrompt }, ...sess.history];
 
-    // 5) Model call
     const isHowTo = looksLikeHowTo(message);
-    const temperature = isHowTo ? 0.4 : 0.5;
+    const temperature = isHowTo ? 0.4 : 0.6;
+
     const r = await client.chat.completions.create({
       model: MODEL,
       temperature,
@@ -354,9 +315,9 @@ Links:
     let reply = r?.choices?.[0]?.message?.content
       || "I couldn't find a clear answer. Tell me your truck year, make and model.";
 
-    // 6) Product-type routing (only when user shows buying/fitment intent)
-    let productType = null;
-    if (isBuyingOrFitmentIntent(msg)) {
+    /* ---------- Decide product type ---------- */
+    let productType = forceRecommendType || null;
+    if (!productType && (isBuyingOrFitmentIntent(msg) || isHowTo || isProductLike(msg))) {
       if (/brake pad|brakes|rotor/.test(msg))                      productType = "brake pads";
       else if (/tonneau|bed cover/.test(msg))                      productType = "tonneau cover";
       else if (/lift kit|leveling/.test(msg))                       productType = "lift kit";
@@ -366,24 +327,18 @@ Links:
         productType = "running boards";
     }
 
-    // 7) Build queries
-    let queries = extractProductQueries({
-      userMsg: message,
-      modelReply: reply,
-      vehicle,
-      productType,
-      max: 4
-    });
-
-    // Strong fallback if clearly shopping but nothing extracted
-    if (!queries.length && (isProductLike(message) || isProductLike(reply))) {
-      const veh = [vehicle?.year, vehicle?.make, vehicle?.model].filter(Boolean).join(" ");
-      const seedType = productType || "truck accessories";
-      queries = [veh ? `${veh} ${seedType}` : seedType];
-    }
-
-    // 8) Link only for product-like intent
-    if (queries.length) {
+    /* ---------- Build queries + links only if product-like ---------- */
+    let queries = [];
+    if (productType && (isProductLike(message) || isBuyingOrFitmentIntent(msg) || forceRecommendType)) {
+      queries = extractProductQueries({ userMsg: message, modelReply: reply, vehicle, productType, max: 4 });
+      if (!queries.length) {
+        const veh = [vehicle?.year, vehicle?.make, vehicle?.model].filter(Boolean).join(" ");
+        const seed = veh ? `${veh} ${productType}` : productType;
+        queries = [seed];
+      }
+      // GEO aware link injection
+      const country = detectCountryLimited(req);
+      const marketplace = resolveMarketplace(country);
       reply = injectAffiliateLinks(
         reply,
         queries.map(q => ({ name: q, url: buildAmazonSearchURL(q, { marketplace }) }))
@@ -396,9 +351,26 @@ ${lines.join("\n")}
 As an Amazon Associate, we may earn from qualifying purchases.`;
     }
 
-    // 9) Save + return
+    /* ---------- Generate proactive follow-up (as separate bubble) ---------- */
+    let followup = null;
+    const now = Date.now();
+    const askCooldownOk = !sess._pending_offer || (now - (sess._pending_offer?.at||0) > 3*60*1000);
+
+    if (!forceRecommendType && askCooldownOk) {
+      // Offer only when we just did a how-to or the user looked producty
+      if (isHowTo && productType) {
+        followup = `Want me to pull ${productType} that fit your vehicle (with quick pros/cons)?`;
+        sess._pending_offer = { type: productType, at: now };
+      } else if (isProductLike(message) && productType && isGeneralInfoIntent(message) === false) {
+        followup = `Do you want recommendations for ${productType} that fit your truck?`;
+        sess._pending_offer = { type: productType, at: now };
+      }
+    }
+
+    /* ---------- Save/return ---------- */
     pushHistory(sess, "assistant", reply);
-    return res.json({ reply });
+    if (followup) pushHistory(sess, "assistant", followup); // so the model sees it next turn
+    return res.json(followup ? { reply, followup } : { reply });
 
   } catch (e) {
     console.error("[/chat] error", e?.response?.data || e.message || e);
@@ -408,7 +380,10 @@ As an Amazon Associate, we may earn from qualifying purchases.`;
   }
 });
 
-/* ---- Lightweight embeddable chat widget (served by Render) ---- */
+/* ---- Test widget (optional) ----
+   NOTE: This widget understands the new { followup } field and will
+   render the follow-up as a second assistant bubble automatically.
+*/
 app.get("/widget", (_req, res) => {
   res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
@@ -450,7 +425,7 @@ app.get("/widget", (_req, res) => {
     d.innerHTML = '<div class="who">'+role+'</div><div class="bubble">'+html+'</div>';
     $m.appendChild(d); $m.scrollTop = $m.scrollHeight;
     try{ parent.postMessage({type:'embed-size',height:document.body.scrollHeight}, '*'); }catch(e){}
-    const links = d.querySelectorAll('a[href]'); links.forEach(a=>{a.target='_blank'; a.rel='nofollow sponsored noopener';});
+    d.querySelectorAll('a[href]').forEach(a=>{a.target='_blank'; a.rel='nofollow sponsored noopener';});
   }
 
   add('AI', 'Hi! I\\'m your AI truck helper. Ask me anything — parts, fitment, or step-by-step how-to.');
@@ -464,6 +439,7 @@ app.get("/widget", (_req, res) => {
       const data = await r.json();
       $m.lastChild.remove();
       add('AI', data && data.reply ? data.reply : 'Sorry, I couldn\\'t get a response.');
+      if (data && data.followup) add('AI', data.followup);
     }catch(err){
       $m.lastChild.remove(); add('AI','Server unavailable. Please try again.');
     }
@@ -474,4 +450,4 @@ app.get("/widget", (_req, res) => {
 });
 
 /* --------------------------------------- */
-app.listen(PORT, () => console.log(`🚀 Truckbot running (no-nag fitment + guarded links + GEO US/UK/CA) on :${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Truckbot running (proactive follow-ups + no-nag fitment + GEO) on :${PORT}`));
