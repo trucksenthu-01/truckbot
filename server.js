@@ -1,8 +1,8 @@
-// server.js — Chat + memory + realistic follow-ups + guarded links + GEO (US/UK/CA)
+// server.js — Chat + memory + realistic follow-ups + guarded product links + GEO (US/UK/CA)
 // - Strong CORS (Android/AMP-safe), OPTIONS preflight
 // - Remembers vehicle per session (year/make/model/etc.)
-// - HOW-TO answers first, then a natural follow-up offer
-// - Affiliate links only when it's clearly PRODUCT intent (not for "Hi")
+// - Short, skimmable answers; open-ended follow-ups
+// - Affiliate links ONLY for product intent (not greetings, not generic tips)
 // - Fitment asked at most once per session
 // - /widget endpoint (for normal + AMP <amp-iframe>)
 
@@ -94,7 +94,7 @@ function missingFitment(vehicle) {
 }
 function saidYes(s=""){ return /\b(yes|yeah|yup|sure|ok|okay|please do|go ahead|why not)\b/i.test(s); }
 
-/* ---------------- Detect greeting/small talk ---------------- */
+/* ---------------- Greetings/small talk ---------------- */
 const GREET_RE = /^\s*(hi|hello|hey|yo|sup|hola|howdy|good\s*(morning|afternoon|evening))\b[\s!\.\?]*$/i;
 function isGreetingOrSmallTalk(text=""){ return GREET_RE.test(text) || text.trim().length < 2; }
 
@@ -126,12 +126,9 @@ function escapeHtml(s = "") {
     return map[ch] || ch;
   });
 }
-function tinySearchLine(q, market){
-  const url = buildAmazonSearchURL(q,{marketplace:market});
-  return `• ${escapeHtml(q)} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
-}
 
-/* ---------------- Brand-agnostic product/category intent ---------------- */
+/* ---------------- Product intent (brand-agnostic) ---------------- */
+// Category vocabulary
 const CATEGORY_TERMS = [
   "cold air intake","air intake","intake","intake kit","intake filter","air filter",
   "tonneau cover","bed cover","retractable tonneau","tri-fold tonneau","hard folding cover","soft roll-up cover",
@@ -150,16 +147,48 @@ function detectCategories(text=""){
   return [...set];
 }
 
-// Catch ANY brand/product phrase (e.g., “K&N 63 Series Aircharger”)
+// Generic phrases that should NEVER be linkified
+const NON_PRODUCT_PHRASES = [
+  "determine compatibility","choose type","research brands","read reviews",
+  "compare prices","check features","warranty & support","warranty and support",
+  "safety notes","installation","backup","legal compliance",
+  "compatibility","choose type","research","read","compare","check","warranty","support","safety","legal"
+];
+
+// Tokens that make a phrase look “producty”
+const PRODUCT_TOKENS = [
+  "series","kit","intake","filter","pads","rotors","brake","cover","shocks","struts","coilover","springs",
+  "tuner","programmer","exhaust","muffler","header","cat-back","nerf","board","boards","steps","step","slider","sliders",
+  "mat","mats","liner","rack","headlight","headlights","taillight","taillights","tire","tires","wheel","wheels",
+  "bar","light","lights","led","winch","hitch","battery"
+];
+
+// Capture 2–7 token Capitalized phrases (e.g., “K&N 63 Series Aircharger”)
 const PROD_PHRASE_RE = /\b([A-Z][A-Za-z0-9&\-]+(?:\s+[A-Z0-9][A-Za-z0-9&\-]+){1,6})\b/g;
+
+// Decide if a candidate phrase is truly product-like
+function isProductishPhrase(phrase=""){
+  const lc = phrase.toLowerCase();
+
+  // drop obvious non-product phrases
+  if (NON_PRODUCT_PHRASES.some(p => lc.includes(p))) return false;
+
+  // must contain at least one product token (single or multi-word) OR alphanum mix (e.g., "63 Series", "MX4")
+  const hasToken = PRODUCT_TOKENS.some(tok => lc.split(/\s+/).includes(tok)) ||
+                   ["cold air intake","light bar","bed liner","floor mats","cat-back"].some(t => lc.includes(t));
+  const hasAlphaNumMix = /\b(?:[a-z]*\d+[a-z]+|[a-z]+[0-9]+)\b/i.test(phrase) || /&/.test(phrase);
+
+  return hasToken || hasAlphaNumMix;
+}
+
 function harvestProductPhrases(text=""){
   if (!text) return [];
   const hits = new Set(); let m;
   while ((m = PROD_PHRASE_RE.exec(text)) !== null) {
-    const phrase = m[1].trim().replace(/\s{2,}/g," ").replace(/[.,;:)\]]+$/,"");
-    if (/^(Here|These|Those|This|That|Popular|Great|Best|Safety|Next)$/i.test(phrase)) continue;
-    if (!/[A-Za-z]/.test(phrase)) continue;
-    hits.add(phrase);
+    const raw = m[1].trim().replace(/\s{2,}/g," ").replace(/[.,;:)\]]+$/,"");
+    if (!/[A-Za-z]/.test(raw)) continue;
+    if (!isProductishPhrase(raw)) continue;
+    hits.add(raw);
   }
   return [...hits];
 }
@@ -171,7 +200,7 @@ function isShoppingIntent(text=""){
   return /\b(cover|intake|kit|pads?|rotors?|brake|shocks?|struts?|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter)\b/i.test(text);
 }
 
-/* ---------------- Link injection ---------------- */
+/* ---------------- Link injection (safe; products only) ---------------- */
 function stripMarkdownBasic(s=""){return s
   .replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1")
   .replace(/^#+\s*(.+)$/gm,"$1").replace(/!\[[^\]]*\]\([^)]+\)/g,"")
@@ -210,29 +239,47 @@ function injectAffiliateLinks(replyText="", products=[]) {
   return out;
 }
 
-/* ---------------- Query extraction (only if product intent) ---------------- */
+/* ---------------- Query extraction (products only) ---------------- */
 function vehicleString(v){ return [v?.year,v?.make,v?.model].filter(Boolean).join(" "); }
 function buildVehicleAwareQuery(vehicle, q) {
   const veh = vehicleString(vehicle);
   return [veh, q].filter(Boolean).join(" ").trim();
 }
 
-function extractProductQueries({ userMsg, modelReply, vehicle, max=6 }){
-  const seeds = new Set();
+function buildQueryItems({ userMsg, modelReply, vehicle, max=6 }){
+  const items = [];
+  const seen = new Set();
 
-  // Strict: only derive seeds from categories/phrases (no generic "Hi")
-  detectCategories(userMsg||"").forEach(c=>seeds.add(c));
-  detectCategories(modelReply||"").forEach(c=>seeds.add(c));
-  harvestProductPhrases(userMsg||"").forEach(p=>seeds.add(p));
-  harvestProductPhrases(modelReply||"").forEach(p=>seeds.add(p));
-
-  // Build vehicle-aware queries
-  const out = [];
-  for (const s of seeds) {
-    out.push(buildVehicleAwareQuery(vehicle, s));
-    if (out.length >= max) break;
+  // categories -> display category; query includes vehicle
+  for (const c of detectCategories(userMsg||"")) {
+    const key = `cat:${c.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
+    items.push({ display: c, query: buildVehicleAwareQuery(vehicle, c) });
+    if (items.length >= max) return items;
   }
-  return out;
+  for (const c of detectCategories(modelReply||"")) {
+    const key = `cat:${c.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
+    items.push({ display: c, query: buildVehicleAwareQuery(vehicle, c) });
+    if (items.length >= max) return items;
+  }
+
+  // product phrases -> display phrase; query includes vehicle
+  for (const p of harvestProductPhrases(userMsg||"")) {
+    const key = `p:${p.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
+    items.push({ display: p, query: buildVehicleAwareQuery(vehicle, p) });
+    if (items.length >= max) return items;
+  }
+  for (const p of harvestProductPhrases(modelReply||"")) {
+    const key = `p:${p.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
+    items.push({ display: p, query: buildVehicleAwareQuery(vehicle, p) });
+    if (items.length >= max) return items;
+  }
+
+  return items;
+}
+
+function tinySearchLineItem(item, marketplace){
+  const url = buildAmazonSearchURL(item.query, { marketplace });
+  return `• ${escapeHtml(item.display)} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
 /* ---------------- Small, skimmable lines + open-ended follow-up ---------------- */
@@ -315,14 +362,18 @@ No raw URLs; links are injected later.`;
 
     // === Only attach affiliate links when it's truly product intent ===
     if (!isGreetingOrSmallTalk(message)) {
-      const queries = extractProductQueries({ userMsg: message, modelReply: reply, vehicle, max: 6 });
+      const items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 6 });
 
-      if (queries.length) {
-        const tagged = queries.map(q => ({ name:q, url: buildAmazonSearchURL(q, { marketplace }) }));
-        reply = injectAffiliateLinks(reply, tagged);
+      if (items.length) {
+        // Link inside the body using product display names
+        const linkTargets = items.map(it => ({
+          name: it.display,
+          url: buildAmazonSearchURL(it.query, { marketplace })
+        }));
+        reply = injectAffiliateLinks(reply, linkTargets);
 
         // Footer with explicit links
-        const lines = queries.map(q => tinySearchLine(q, marketplace));
+        const lines = items.map(it => tinySearchLineItem(it, marketplace));
         reply = `${reply}
 
 You might consider:
@@ -337,7 +388,7 @@ As an Amazon Associate, we may earn from qualifying purchases.`;
     if (tail.length) small += "\n\nYou might consider:" + tail.join("\n\nYou might consider:");
     small += `\n\n${followUpLine(message, vehicle)}`;
 
-    // For pure greeting, keep it super clean (no footer, no salesy tone)
+    // For pure greeting, keep it super clean (no footer)
     if (isGreetingOrSmallTalk(message)) {
       small = "• Hi! How can I help today?\n\n• Parts, fitment, or a quick how-to?";
     }
