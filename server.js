@@ -117,11 +117,53 @@ function buildAmazonSearchURL(query,{tag,marketplace}={}) {
   const assoc = tag || process.env.AFFILIATE_TAG; if (assoc) params.set("tag", assoc);
   return `${base}/s?${params.toString()}`;
 }
-function tinySearchLine(q, market){ const url = buildAmazonSearchURL(q,{marketplace:market});
-  return `• ${q} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
+function escapeHtml(s = "") {
+  return s.replace(/[&<>"']/g, (ch) => {
+    const map = { "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" };
+    return map[ch] || ch;
+  });
+}
+function tinySearchLine(q, market){
+  const url = buildAmazonSearchURL(q,{marketplace:market});
+  return `• ${escapeHtml(q)} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
-/* ---------------- Link injection ---------------- */
+/* ---------------- Brand-agnostic product/category detection ---------------- */
+// 1) Broad category vocabulary (no brand restriction)
+const CATEGORY_TERMS = [
+  "cold air intake","air intake","intake","intake kit","intake filter","air filter",
+  "tonneau cover","bed cover","retractable tonneau","tri-fold tonneau","hard folding cover","soft roll-up cover",
+  "lift kit","leveling kit","shocks","struts","coilovers","springs",
+  "brake pads","rotors","brakes",
+  "running boards","nerf bars","side steps","power steps","rock sliders",
+  "floor mats","bed liner","rack","exhaust","muffler","cat-back","header",
+  "tuner","programmer","scanner",
+  "headlights","taillights","light bar","fog lights",
+  "wheels","tires","all terrain","mud terrain"
+];
+const CATEGORY_RE = new RegExp("\\b(" + CATEGORY_TERMS.map(s=>s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("|") + ")\\b","gi");
+function detectCategories(text=""){
+  const set = new Set(); let m;
+  while ((m = CATEGORY_RE.exec(text)) !== null) set.add(m[1].toLowerCase());
+  return [...set];
+}
+
+// 2) Brand-agnostic product phrases (match ANY brand/product text like “K&N 63 Series Aircharger” or “aFe Magnum FORCE”)
+const PROD_PHRASE_RE = /\b([A-Z][A-Za-z0-9&\-]+(?:\s+[A-Z0-9][A-Za-z0-9&\-]+){1,6})\b/g;
+function harvestProductPhrases(text=""){
+  if (!text) return [];
+  const hits = new Set(); let m;
+  while ((m = PROD_PHRASE_RE.exec(text)) !== null) {
+    const phrase = m[1].trim().replace(/\s{2,}/g," ").replace(/[.,;:)\]]+$/,"");
+    // skip obvious non-products
+    if (/^(Here|These|Those|This|That|Popular|Great|Best|Safety|Next)$/i.test(phrase)) continue;
+    if (!/[A-Za-z]/.test(phrase)) continue;
+    hits.add(phrase);
+  }
+  return [...hits];
+}
+
+/* ---------------- Link injection (use ANY product/category) ---------------- */
 function stripMarkdownBasic(s=""){return s
   .replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1")
   .replace(/^#+\s*(.+)$/gm,"$1").replace(/!\[[^\]]*\]\([^)]+\)/g,"")
@@ -132,9 +174,16 @@ const _toks = s => _norm(s).split(" ").filter(t=>t&&!_STOP.has(t));
 function buildOrderedTokenRegex(name){ const ts=_toks(name); if(!ts.length) return null;
   const chosen=ts.slice(0,Math.min(3,ts.length)); const pattern=chosen.map(t=>`(${t})`).join(`\\s+`);
   return new RegExp(`\\b${pattern}\\b`,"gi"); }
+
 function injectAffiliateLinks(replyText="", products=[]) {
   if(!replyText || !products?.length) return replyText;
+  // do NOT restrict by brand; link every product/category phrase
   let out = stripMarkdownBasic(replyText);
+
+  // Keep existing anchors intact
+  const anchors = [];
+  out = out.replace(/<a\b[^>]*>.*?<\/a>/gi, (m) => { anchors.push(m); return `__A${anchors.length-1}__`; });
+
   for(const p of products){
     const url=p?.url, full=p?.name; if(!url||!full) continue;
     const tokenRe=buildOrderedTokenRegex(full);
@@ -148,54 +197,71 @@ function injectAffiliateLinks(replyText="", products=[]) {
       out = out.replace(exactRe, `<a href="${url}" target="_blank" rel="nofollow sponsored noopener">$1</a>`);
     }
   }
+
+  // Restore anchors
+  out = out.replace(/__A(\d+)__/g, (_,i)=>anchors[+i]);
   return out;
 }
 
-/* ---------------- Product detection + query extraction ---------------- */
-const BRAND_WHITELIST = [
-  "AMP Research","PowerStep","BAKFlip","UnderCover","TruXedo","Extang","Retrax",
-  "Gator","Rough Country","Bilstein","DiabloSport","Hypertech","Motorcraft",
-  "Power Stop","WeatherTech","Tyger","Nitto","BFGoodrich","Falken","K&N",
-  "Borla","Flowmaster","Gator EFX","ArmorFlex","MX4","Ultra Flex","Lo Pro",
-  "Sentry CT","Solid Fold","Husky","FOX","Rancho","Monroe","Moog","ACDelco",
-  "Dorman","Bosch","NGK","Mopar","N-Fab","NFab","Westin","Go Rhino","Ionic",
-  "Luverne","ARIES","Dee Zee","Tyger Auto"
-];
-
-const PRODUCT_TERMS =
-  /(tonneau|bed\s*cover|lift\s*kit|level(ing)?\s*kit|tire|wheel|brake|pad|rotor|shock|strut|bumper|nerf\s*bar|nerf\s*bars|running\s*board|running\s*boards|side\s*step|side\s*steps|step\s*bar|step\s*bars|power ?step|tuner|programmer|intake|filter|exhaust|coilover|spring|winch|hitch|battery|floor\s*mat|bed\s*liner|rack|headlight|taillight)/i;
-
-function isProductLike(text=""){
-  if(!text) return false;
-  if(PRODUCT_TERMS.test(text)) return true;
-  return BRAND_WHITELIST.some(b => new RegExp(`\\b${b.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}\\b`,"i").test(text));
+/* ---------------- Product detection + query extraction (brand-agnostic) ---------------- */
+function vehicleString(v){ return [v?.year,v?.make,v?.model].filter(Boolean).join(" "); }
+function buildVehicleAwareQuery(vehicle, q) {
+  const veh = vehicleString(vehicle);
+  return [veh, q].filter(Boolean).join(" ").trim();
 }
 
-function extractProductQueries({ userMsg, modelReply, vehicle, productType, max=4 }){
-  const out=[];
-  if(productType){
-    const veh=[vehicle?.year,vehicle?.make,vehicle?.model].filter(Boolean).join(" ");
-    if(veh) out.push(`${veh} ${productType}`);
+function extractProductQueries({ userMsg, modelReply, vehicle, productType, max=6 }){
+  const seeds = new Set();
+
+  // categories from both sides
+  detectCategories(userMsg||"").forEach(c=>seeds.add(c));
+  detectCategories(modelReply||"").forEach(c=>seeds.add(c));
+
+  // product phrases from both sides
+  harvestProductPhrases(userMsg||"").forEach(p=>seeds.add(p));
+  harvestProductPhrases(modelReply||"").forEach(p=>seeds.add(p));
+
+  // optional productType hint
+  if (productType) seeds.add(productType);
+
+  // always include the user's ask as a fallback query
+  if ((userMsg||"").trim()) seeds.add((userMsg||"").trim());
+
+  const out = [];
+  for (const s of seeds) {
+    const q = buildVehicleAwareQuery(vehicle, s);
+    out.push(q);
+    if (out.length >= max) break;
   }
-  const rx = /\b([A-Z][a-zA-Z]+(?:\s[A-Z0-9][a-zA-Z0-9\.\-]+){0,3})\b/g;
-  const rep = (modelReply||"").match(rx)||[];
-  const usr = (userMsg||"").match(rx)||[];
-  [...rep,...usr].forEach(c=>{ if(BRAND_WHITELIST.some(b=>c.toLowerCase().includes(b.toLowerCase()))) out.push(c); });
-  if(!out.length && isProductLike(userMsg||"")) out.push(userMsg.trim());
-  const seen=new Set(), ded=[]; for(const s of out){ const k=s.toLowerCase().trim(); if(!k||seen.has(k)) continue; seen.add(k); ded.push(s.trim()); if(ded.length>=max) break; }
-  return ded;
+  return out;
 }
 
 /* ---------------- Diagnostics ---------------- */
 app.get("/health", (_req,res)=>res.send("ok"));
 app.post("/echo", (req,res)=>res.json({ ok:true, origin:req.headers.origin||null, ua:req.headers["user-agent"]||null }));
 
+/* ---------------- Small, skimmable lines + open-ended follow-up ---------------- */
+function toBullets(text=""){
+  // turn sentences into bullets; keep anchors and line breaks where present
+  const parts = text.replace(/\s+/g," ").split(/(?<=[\.!?])\s+(?=[A-Z0-9])/).map(s=>s.trim()).filter(Boolean);
+  if (!parts.length) return text;
+  return parts.map(l => l.startsWith("•") ? l : `• ${l}`).join("\n");
+}
+function followUpLine(message, vehicle){
+  const isHowTo = looksLikeHowTo(message);
+  if (isHowTo) {
+    const v = vehicleString(vehicle);
+    return v ? "• Want me to pull parts that fit your setup?" : "• Want me to pull parts that fit your truck?";
+  }
+  return "• Want budget, brand picks, or install tips?";
+}
+
 /* ---------------- Chat ---------------- */
 app.post("/chat", async (req, res) => {
   try {
     const { message, session, country:bodyCountry, market:bodyMarket } = req.body || {};
     if (!message || typeof message !== "string") {
-      return res.status(200).json({ reply: "Missing 'message' (string) in body." });
+      return res.status(200).json({ reply: "• Tell me what you’d like help with (parts, fitment, or a how-to)." });
     }
 
     const country = normalizeCountry(bodyCountry) || detectCountryLimited(req);
@@ -206,35 +272,37 @@ app.post("/chat", async (req, res) => {
     // Update memory
     pushHistory(sess, "user", message);
 
-    // Parse + merge vehicle
-    const parsed = extractIntent ? extractIntent(message||"") : {};
+    // Parse + merge vehicle (keep your extractor; we only store once)
+    const parsed = extractIntent ? (extractIntent(message||"") || {}) : {};
     const vehicle = mergeVehicleMemory(sess, parsed);
 
-    // If user said "yes" and we haven't got fitment, ask for it
-    if (saidYes(message) && (!vehicle.year || !vehicle.make || !vehicle.model)) {
-      const ask = "Great! What’s your truck’s **year, make, and model**? (e.g., 2019 Ford F-150 5.5 ft bed XLT)";
-      pushHistory(sess, "assistant", ask);
-      return res.status(200).json({ reply: ask });
-    }
-
-    // If clearly shopping but missing 2+ core fields, ask once
-    const wantsProducts = isProductLike(message);
+    // -------------- Change #2: ask fitment ONLY ONCE --------------
     const miss = missingFitment(vehicle);
-    if (wantsProducts && miss.length >= 2 && !sess.flags.askedFitmentOnce) {
-      const ask = `To recommend exact parts, what is your truck’s ${miss.join(" & ")}? (e.g., 2019 Ford F-150 5.5 ft bed XLT)`;
-      sess.flags.askedFitmentOnce = true;
-      pushHistory(sess, "assistant", ask);
-      return res.status(200).json({ reply: ask });
-    }
+    const wantsProducts = /cover|intake|kit|pads|rotor|brake|shocks|struts|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter/i.test(message);
 
-    // Compose system prompt + history
+    if (!sess.flags.askedFitmentOnce) {
+      if (saidYes(message) && miss.length > 0) {
+        const ask = "• Great—what’s your **year, make, model**? (e.g., 2020 Ford F-150 5.5 ft bed)";
+        sess.flags.askedFitmentOnce = true;
+        pushHistory(sess, "assistant", ask);
+        return res.status(200).json({ reply: ask });
+      }
+      if (wantsProducts && miss.length >= 2) {
+        const ask = `• To dial this in, what’s your **${miss.join(" & ")}**?\n• Example: 2020 Ford F-150 5.5 ft bed`;
+        sess.flags.askedFitmentOnce = true;
+        pushHistory(sess, "assistant", ask);
+        return res.status(200).json({ reply: ask });
+      }
+    }
+    // after this point we never ask again this session
+
+    // Compose system prompt + history (Change #3: shorter lines)
     const systemPrompt = `
-You are "Trucks Helper" — a precise, friendly truck expert.
-- Be concise, step-by-step when asked "how to".
-- Use the known vehicle profile for fitment and product guidance.
-- If a fitment detail is missing, ask a SINGLE follow-up (once).
-- Do not paste URLs; links are injected later.
-- Tone: practical, human.`;
+You are "Trucks Helper" — precise, friendly, human.
+Write short lines. Prefer bullets. Avoid long paragraphs.
+For HOW-TO: steps first, safety notes next.
+Use known vehicle details automatically. Do not re-ask fitment more than once.
+No raw URLs; links are injected later.`;
 
     const isHowTo = looksLikeHowTo(message);
     const base = [{ role:"system", content:systemPrompt }, ...sess.history];
@@ -246,35 +314,25 @@ You are "Trucks Helper" — a precise, friendly truck expert.
     });
 
     let reply = r?.choices?.[0]?.message?.content
-      || "I couldn’t find a clear answer. Tell me your truck year, make, and model.";
+      || "• Tell me what you’re working on and I’ll jump in.";
 
-    // Product-type routing
-    let productType = null;
-    const m = message.toLowerCase();
-    if (isHowTo && /brake|pad|rotor/.test(m)) productType = "brake pads";
-    else if (/brake pad|brakes|rotor/.test(m)) productType = "brake pads";
-    else if (/tonneau|bed cover/.test(m)) productType = "tonneau cover";
-    else if (/lift kit|leveling/.test(m)) productType = "lift kit";
-    else if (/tire|all terrain|mud terrain/.test(m)) productType = "tires";
-    else if (/tuner|programmer|diablosport|hypertech|hyper tuner/.test(m)) productType = "tuner";
-    else if (/(nerf bar|nerf bars|running board|running boards|side step|side steps|step bar|step bars|power ?step|rock slider|rock sliders)/i.test(m)) productType = "running boards";
+    // -------------- Change #1: link ANY brand/product/category --------------
+    const productType = null; // we don’t restrict by curated types anymore
+    let queries = extractProductQueries({ userMsg: message, modelReply: reply, vehicle, productType, max: 6 });
 
-    // Build product queries
-    let queries = extractProductQueries({ userMsg: message, modelReply: reply, vehicle, productType, max: 4 });
-
-    // Fallback seed if clearly shopping
-    if (!queries.length && (isProductLike(message) || isProductLike(reply))) {
-      const veh = [vehicle?.year, vehicle?.make, vehicle?.model].filter(Boolean).join(" ");
-      const seedType = productType || "truck accessories";
-      queries = [veh ? `${veh} ${seedType}` : seedType];
+    // Fallback if nothing detected but it looks like shopping
+    if (!queries.length && wantsProducts) {
+      const veh = vehicleString(vehicle);
+      const seed = veh ? `${veh} truck accessories` : "truck accessories";
+      queries = [seed];
     }
 
-    // Inject links if any queries
     if (queries.length) {
-      reply = injectAffiliateLinks(
-        reply,
-        queries.map(q => ({ name:q, url: buildAmazonSearchURL(q, { marketplace }) }))
-      );
+      // Build URL map and link inside body
+      const tagged = queries.map(q => ({ name:q, url: buildAmazonSearchURL(q, { marketplace }) }));
+      reply = injectAffiliateLinks(reply, tagged);
+
+      // Add footer with explicit links
       const lines = queries.map(q => tinySearchLine(q, marketplace));
       reply = `${reply}
 
@@ -283,21 +341,27 @@ ${lines.join("\n")}
 As an Amazon Associate, we may earn from qualifying purchases.`;
     }
 
-    // Natural upsell after HOW-TO (only once)
-    if (isHowTo && !sess.flags.offeredUpsellAfterHowTo) {
-      reply += `
+    // -------------- Change #3: enforce small, skimmable bullets --------------
+    const [core, ...tail] = reply.split("\n\nYou might consider:");
+    let small = toBullets(core);
+    if (tail.length) small += "\n\nYou might consider:" + tail.join("\n\nYou might consider:");
 
-Would you like me to find **parts that fit your vehicle** for this job?`;
+    // -------------- Change #4: open-ended follow-up --------------
+    small += `\n\n${followUpLine(message, vehicle)}`;
+
+    // Keep your “upsell after HOW-TO” flag behavior (still once)
+    if (isHowTo && !sess.flags.offeredUpsellAfterHowTo) {
+      small += `\n• Want me to fetch parts lists or torque specs?`;
       sess.flags.offeredUpsellAfterHowTo = true;
     }
 
-    pushHistory(sess, "assistant", reply);
-    return res.status(200).json({ reply });
+    pushHistory(sess, "assistant", small);
+    return res.status(200).json({ reply: small });
 
   } catch (e) {
     console.error("[/chat] error", e?.response?.data || e.message || e);
     return res.status(200).json({
-      reply: "I’m having trouble reaching the AI right now. Meanwhile, if you share your truck year, make, and model, I’ll fetch exact parts that fit."
+      reply: "• I’m having trouble reaching the AI.\n• Share your truck **year/make/model** and what you need, and I’ll pick it up next."
     });
   }
 });
@@ -359,7 +423,7 @@ a{color:var(--muted);text-decoration:underline}
     return {node:d, stop:()=>clearInterval(id)};
   }
 
-  add('AI',"Hi! I'm your AI truck helper. Ask me anything — parts, fitment, or step-by-step how-to.");
+  add('AI',"• Hi! I’m your AI truck helper.\\n• Ask me anything — parts, fitment, or step-by-step how-to.");
 
   $f.addEventListener('submit', async e=>{
     e.preventDefault();
