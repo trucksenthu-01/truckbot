@@ -1,28 +1,46 @@
-// server.js — Chat + memory that *actually* remembers fitment (no repeat asks)
-// - Fitment memory is sticky per session (year/make/model/trim/engine/bed)
-// - Built-in fallback vehicle parser (F150/F-150, Ram 1500, etc.)
-// - Only asks for fitment if 2+ core fields are missing *and* we haven't asked before
-// - If 1 core field missing: answer anyway and add a single soft ask at the end
-// - If user already gave fitment once, never ask again unless they clearly change trucks
-// - Brand follow-ups (“why AMP?”) don’t re-trigger the fitment gate
-// - Small-liners output + natural follow-ups + GEO Amazon links
+// server.js — Chat + memory + small-liner tone + friendly follow-ups + guarded links + robust CORS
+// - Remembers vehicle per session (year/make/model/etc.) — no repeat ask when known
+// - Answers in short lines (bulleted), brand-friendly tone
+// - HOW-TO: steps first, then a natural "Want parts that fit?" follow-up
+// - Shopping: adds Amazon search links (affiliate + GEO marketplace), never overlinks
+// - Strong CORS (Android/AMP/webviews), OPTIONS preflight
+// - /widget still available if you embed it; /health & /echo for diagnostics
 
 import "dotenv/config";
 import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
-import { extractIntent as externalIntent } from "./recommend.js"; // optional
+
+// Optional: keep your own intent extractor if present
+import { extractIntent } from "./recommend.js";
 
 const app = express();
 app.use(bodyParser.json({ limit: "1mb" }));
 
-/* ---------------- CORS: Android/AMP-safe ---------------- */
+/* ---------------- CORS: robust across Android webviews/AMP ---------------- */
+const RAW_ORIGINS = (process.env.ALLOWED_ORIGINS ||
+  "https://trucksenthusiasts.com,https://www.trucksenthusiasts.com,https://cdn.ampproject.org,https://*.ampproject.org,https://www.google.com"
+).split(",").map(s => s.trim()).filter(Boolean);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // curl / same-origin
+  return RAW_ORIGINS.some(pat => {
+    if (pat.includes("*")) {
+      const re = new RegExp("^" + pat.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
+      return re.test(origin);
+    }
+    return origin === pat;
+  });
+}
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
-  res.setHeader("Access-Control-Max-Age", "86400");
+  const origin = req.headers.origin || "";
+  if (isAllowedOrigin(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+    res.setHeader("Access-Control-Allow-Credentials", "false");
+  }
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -33,19 +51,18 @@ const MODEL  = process.env.MODEL || "gpt-4o-mini";
 const PORT   = process.env.PORT || 3000;
 
 /* ---------------- Session memory ---------------- */
-const SESSIONS = new Map(); // sessionId -> { history: [], vehicle:{}, flags:{} }
+const SESSIONS = new Map(); // sessionId -> { history, vehicle, flags }
 const MAX_TURNS = 18;
 
 function getSession(sessionId) {
   if (!SESSIONS.has(sessionId)) {
     SESSIONS.set(sessionId, {
       history: [],
-      vehicle: {},
+      vehicle: {}, // {year, make, model, bed, trim, engine}
       flags: {
-        askedFitmentOnce: false,  // we asked at least once in this session
-        fitmentConfirmed: false,  // we *have* year+make+model memorized
-        offeredAfterHowTo: false,
-        lastTopic: null
+        askedFitmentOnce: false,
+        offeredUpsellAfterHowTo: false,
+        lastFitmentAskAt: 0
       }
     });
   }
@@ -59,97 +76,29 @@ function pushHistory(sess, role, content) {
 }
 
 /* ---------------- Utilities ---------------- */
-const HOWTO_KEYWORDS = ["how to","how do i","procedure","steps","install","replace","change","fix","tutorial","guide"];
-function looksLikeHowTo(s=""){const t=s.toLowerCase();return HOWTO_KEYWORDS.some(k=>t.includes(k));}
-function saidYes(s=""){return /\b(yes|yeah|yup|sure|ok|okay|please do|go ahead|why not|y|proceed)\b/i.test(s);}
-
-/* ----- Vehicle parsing: robust local fallback (in addition to external extractor) ----- */
-const MAKE_LIST = [
-  "Ford","Chevrolet","Chevy","GMC","Ram","Dodge","Toyota","Nissan","Honda","Jeep",
-  "Mazda","Hyundai","Kia","Volkswagen","VW","Subaru","Mitsubishi","Lincoln","Cadillac"
+const HOWTO_KEYWORDS = [
+  "how to","how do i","procedure","steps","install","replace","change","fix","tutorial","guide"
 ];
-const MAKE_RE = new RegExp("\\b(" + MAKE_LIST.map(m=>m.replace(/[-/\\^$*+?.()|[\]{}]/g,"\\$&")).join("|") + ")\\b","i");
-
-// Normalize common model tokens
-function normModelToken(s=""){
-  return s
-    .replace(/\bF\s*[- ]?\s*150\b/i, "F-150")
-    .replace(/\bF\s*[- ]?\s*250\b/i, "F-250")
-    .replace(/\bF\s*[- ]?\s*350\b/i, "F-350")
-    .replace(/\bSilverado\s*1500\b/i, "Silverado 1500")
-    .replace(/\bSierra\s*1500\b/i, "Sierra 1500")
-    .replace(/\bRam\s*1500\b/i, "Ram 1500")
-    .trim();
-}
-function parseVehicleFallback(text=""){
-  const t = text.replace(/’/g,"'").replace(/–|—/g,"-");
-  // Patterns:
-  // 1) Year + Make + Model (loose)
-  //    e.g., "2020 Ford F150", "2019 Toyota Tacoma", "’18 F-150"
-  const yearMatch = t.match(/\b(20\d{2}|19\d{2}|'\d{2})\b/);
-  let year = null;
-  if (yearMatch) {
-    const y = yearMatch[1];
-    year = y.startsWith("'") ? (y.length===3 ? ("20"+y.slice(1)) : null) : y;
-  }
-  const makeMatch = t.match(MAKE_RE);
-  let make = makeMatch ? makeMatch[1] : null;
-
-  // Model: grab the token(s) after the make or common truck models if no make
-  let model = null;
-  if (make) {
-    const after = t.slice(makeMatch.index + make.length).trim();
-    const m = after.match(/\b([A-Za-z0-9\-]+(?:\s?[A-Za-z0-9\-]+){0,2})\b/);
-    if (m) model = m[1];
-  } else {
-    // Try common trucks without make provided
-    const common = t.match(/\b(F\s*[- ]?\s*150|F\s*[- ]?\s*250|F\s*[- ]?\s*350|Tacoma|Tundra|Silverado\s*1500|Sierra\s*1500|Ram\s*1500|Ranger|Colorado|Frontier)\b/i);
-    if (common) model = common[1];
-  }
-
-  if (model) model = normModelToken(model);
-  // Normalize make names
-  if (make && /chevy/i.test(make)) make = "Chevrolet";
-
-  // Optional extras
-  const bed = (/\b(5\.5|6\.5|8)\s*(ft|foot|feet|')\b/i.test(t)) ? RegExp.$1 + " ft" : null;
-  const trim = (/\b(Lariat|XLT|XL|Limited|Platinum|TRD\s*Pro|TRD|Rebel|Big Horn|LTZ|LT|Raptor)\b/i.exec(t) || [])[1] || null;
-  const engine = (/\b(3\.5L|2\.7L|5\.0L|5\.7L|6\.2L)\b/i.exec(t) || [])[1] || null;
-
-  const out = {};
-  if (year) out.year = String(year);
-  if (make) out.make = make;
-  if (model) out.model = model;
-  if (bed) out.bed = bed;
-  if (trim) out.trim = trim;
-  if (engine) out.engine = engine;
-  return out;
-}
+function looksLikeHowTo(s=""){const t=s.toLowerCase();return HOWTO_KEYWORDS.some(k=>t.includes(k));}
 
 function mergeVehicleMemory(sess, from = {}) {
   const v = sess.vehicle || {};
   const merged = {
-    year:   from.year   ?? v.year   ?? null,
-    make:   from.make   ?? v.make   ?? null,
-    model:  from.model  ?? v.model  ?? null,
-    bed:    from.bed    ?? v.bed    ?? null,
-    trim:   from.trim   ?? v.trim   ?? null,
-    engine: from.engine ?? v.engine ?? null,
+    year:   from.year   || v.year   || null,
+    make:   from.make   || v.make   || null,
+    model:  from.model  || v.model  || null,
+    bed:    from.bed    || v.bed    || null,
+    trim:   from.trim   || v.trim   || null,
+    engine: from.engine || v.engine || null,
   };
-  // Mark confirmed once we have core trio
-  if (merged.year && merged.make && merged.model) sess.flags.fitmentConfirmed = true;
-  sess.vehicle = merged;
-  return merged;
+  sess.vehicle = merged; return merged;
 }
 function missingFitment(vehicle) {
   const miss=[]; if(!vehicle.year) miss.push("year"); if(!vehicle.make) miss.push("make"); if(!vehicle.model) miss.push("model"); return miss;
 }
+function fitmentKnown(vehicle){ return !!(vehicle.year && vehicle.make && vehicle.model); }
 
-// Detect an explicit new truck statement → refresh memory
-function looksLikeNewTruck(text=""){
-  return /\b(my|new|another)\b.*\b(19|20)\d{2}\b/i.test(text) ||
-         (MAKE_RE.test(text) && /\b(19|20)\d{2}\b/.test(text));
-}
+function saidYes(s=""){ return /\b(yes|yeah|yup|sure|ok|okay|pls|please do|go ahead|why not)\b/i.test(s); }
 
 /* ---------------- GEO -> marketplace ---------------- */
 const COUNTRY_TO_TLD_LIMITED = { US:"com", GB:"co.uk", UK:"co.uk", CA:"ca" };
@@ -177,7 +126,7 @@ function tinySearchLine(q, market){ const url = buildAmazonSearchURL(q,{marketpl
   return `• ${escapeHtml(q)} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
-/* ---------------- Link helpers ---------------- */
+/* ---------------- Link injection ---------------- */
 function stripMarkdownBasic(s=""){return s
   .replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1")
   .replace(/^#+\s*(.+)$/gm,"$1").replace(/!\[[^\]]*\]\([^)]+\)/g,"")
@@ -207,7 +156,7 @@ function injectAffiliateLinks(replyText="", products=[]) {
   return out;
 }
 
-/* ---------------- Product detection + extraction ---------------- */
+/* ---------------- Product detection + query extraction ---------------- */
 const BRAND_WHITELIST = [
   "AMP Research","PowerStep","BAKFlip","UnderCover","TruXedo","Extang","Retrax",
   "Gator","Rough Country","Bilstein","DiabloSport","Hypertech","Motorcraft",
@@ -215,8 +164,9 @@ const BRAND_WHITELIST = [
   "Borla","Flowmaster","Gator EFX","ArmorFlex","MX4","Ultra Flex","Lo Pro",
   "Sentry CT","Solid Fold","Husky","FOX","Rancho","Monroe","Moog","ACDelco",
   "Dorman","Bosch","NGK","Mopar","N-Fab","NFab","Westin","Go Rhino","Ionic",
-  "Luverne","ARIES","Dee Zee","Tyger Auto","AMP"
+  "Luverne","ARIES","Dee Zee","Tyger Auto"
 ];
+
 const PRODUCT_TERMS =
   /(tonneau|bed\s*cover|lift\s*kit|level(ing)?\s*kit|tire|wheel|brake|pad|rotor|shock|strut|bumper|nerf\s*bar|nerf\s*bars|running\s*board|running\s*boards|side\s*step|side\s*steps|step\s*bar|step\s*bars|power ?step|tuner|programmer|intake|filter|exhaust|coilover|spring|winch|hitch|battery|floor\s*mat|bed\s*liner|rack|headlight|taillight)/i;
 
@@ -241,25 +191,48 @@ function extractProductQueries({ userMsg, modelReply, vehicle, productType, max=
   return ded;
 }
 
-/* ---------------- Small-liners formatter ---------------- */
-function toSmallLines(htmlOrText="") {
-  if (/<(ul|ol|br|table|li)\b/i.test(htmlOrText)) return htmlOrText;
-  const parts = String(htmlOrText).split(/\n\s*\n/g).map(s => s.trim()).filter(Boolean);
-  const items = (parts.length ? parts : [htmlOrText])
-    .flatMap(p => {
-      const sentences = p.split(/(?<=[.!?])\s+(?=[A-Z(])/g).filter(Boolean);
-      return sentences.length ? sentences : [p];
-    })
-    .map(s => s.trim())
+/* ---------------- Small-liner + tone helpers ---------------- */
+function escapeHtml(s=""){return s.replace(/[&<>"]/g, m => ({'&':'&','<':'<','>':'>','"':'"'}[m]));}
+
+// Turn any model text into short, readable lines.
+// - Keep existing bullets/headers
+// - Don’t break anchor links
+// - Add "• " prefix where it reads as a list
+function smallify(html=""){
+  // If reply already contains anchor tags or explicit bullets, keep structure
+  if (/<a\s/i.test(html)) {
+    return html.split(/\n{2,}/).map(chunk=>{
+      const lines = chunk.split(/\n/).map(s=>s.trim()).filter(Boolean);
+      return lines.map(l=> l.startsWith("•") ? l : `• ${l}`).join("\n");
+    }).join("\n\n");
+  }
+  // Otherwise, sentence split → bullets
+  const parts = html
+    .replace(/\s+/g," ")
+    .split(/(?<=[\.!?])\s+(?=[A-Z0-9])/)
+    .map(s=>s.trim())
     .filter(Boolean);
-  return items.map(line => `• ${escapeHtmlExceptAnchors(line)}`).join("<br>");
+  if (!parts.length) return html;
+  return parts.map(l => l.startsWith("•") ? l : `• ${l}`).join("\n");
 }
-function escapeHtmlExceptAnchors(s=""){
-  const keepA = s.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  return keepA.replace(/&lt;a\s/gi, "<a ").replace(/&lt;\/a&gt;/gi, "</a>");
-}
-function escapeHtml(s=""){
-  return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+
+// Friendly follow-up to keep engagement (never re-asks fitment if known)
+function followUp(vehicle, userMsg, productType) {
+  if (looksLikeHowTo(userMsg)) {
+    if (fitmentKnown(vehicle)) {
+      const veh = `${vehicle.year} ${vehicle.make} ${vehicle.model}`;
+      return `• Want me to pull **parts that fit your ${veh}** for this job?`;
+    }
+    return `• Want me to pull **parts that fit your truck** for this job?`;
+  }
+  if (isProductLike(userMsg)) {
+    const bits = [];
+    bits.push("• Do you prefer **power-deploying** or **fixed** steps?");
+    bits.push("• Any budget range you want me to stay within?");
+    if (!fitmentKnown(vehicle)) bits.push("• I can check fitment too — share your year/make/model if you like.");
+    return bits.join("\n");
+  }
+  return "• Want quick **fitment checks** or **price ranges** for that?";
 }
 
 /* ---------------- Diagnostics ---------------- */
@@ -271,7 +244,7 @@ app.post("/chat", async (req, res) => {
   try {
     const { message, session, country:bodyCountry, market:bodyMarket } = req.body || {};
     if (!message || typeof message !== "string") {
-      return res.status(200).json({ reply: "Missing 'message' (string) in body." });
+      return res.status(200).json({ reply: "• Tell me what you’d like help with (parts, fitment, or a how-to)." });
     }
 
     const country = normalizeCountry(bodyCountry) || detectCountryLimited(req);
@@ -279,54 +252,46 @@ app.post("/chat", async (req, res) => {
     const sessionId = (session || "visitor").toString().slice(0, 60);
     const sess = getSession(sessionId);
 
-    // Parse possible *new* vehicle from this user turn
-    const ext = externalIntent ? (externalIntent(message||"") || {}) : {};
-    const fb  = parseVehicleFallback(message||"");
-    const parsed = { ...ext, ...fb };
-
-    // If user clearly mentioned a new/different truck, refresh (parsed will carry the new values)
-    if (looksLikeNewTruck(message) && (parsed.year || parsed.make || parsed.model)) {
-      sess.vehicle = {}; // reset old
-      sess.flags.fitmentConfirmed = false;
-      sess.flags.askedFitmentOnce = false;
-    }
-
-    // Merge memory
-    const vehicle = mergeVehicleMemory(sess, parsed);
-
-    // Update history after parsing so the model sees the current message too
+    // Update memory from this turn
     pushHistory(sess, "user", message);
 
-    const hasCore = !!(vehicle.year && vehicle.make && vehicle.model);
-    const miss = hasCore ? [] : missingFitment(vehicle);
+    // Parse & merge vehicle profile
+    const parsed = extractIntent ? extractIntent(message||"") : {};
+    const vehicle = mergeVehicleMemory(sess, parsed);
 
-    // Fitment gate: ONLY if clearly shopping AND 2+ core fields are missing AND we haven't asked before AND we don't already have core
+    // If user said "yes" but fitment incomplete, gently ask (only once every 2 min)
+    if (saidYes(message) && !fitmentKnown(vehicle)) {
+      const now=Date.now();
+      if (now - (sess.flags.lastFitmentAskAt||0) > 120000) {
+        const ask = "• Great — what’s your **year, make, and model**? (e.g., 2020 Ford F-150 5.5 ft bed XLT)";
+        sess.flags.lastFitmentAskAt = now;
+        pushHistory(sess, "assistant", ask);
+        return res.status(200).json({ reply: ask });
+      }
+    }
+
+    // Only ask for fitment IF clearly shopping AND 2+ core fields missing AND we haven't asked recently
     const wantsProducts = isProductLike(message);
-    if (wantsProducts && !hasCore && miss.length >= 2 && !sess.flags.askedFitmentOnce) {
-      const ask = toSmallLines(`To recommend exact parts, I need your truck’s ${miss.join(" & ")}.\n\nExample: 2020 Ford F-150 5.5 ft bed XLT`);
+    const miss = missingFitment(vehicle);
+    if (wantsProducts && miss.length >= 2 && !sess.flags.askedFitmentOnce) {
+      const ask = `• To dial this in, what’s your truck’s **${miss.join(" & ")}**?\n• Example: 2020 Ford F-150 5.5 ft bed XLT`;
       sess.flags.askedFitmentOnce = true;
+      sess.flags.lastFitmentAskAt = Date.now();
       pushHistory(sess, "assistant", ask);
       return res.status(200).json({ reply: ask });
     }
 
-    // If user says "yes" and we still don't have core, ask once (but not repeatedly)
-    if (saidYes(message) && !hasCore && !sess.flags.askedFitmentOnce) {
-      const ask = toSmallLines("Great! What’s your truck’s **year, make, and model**?\n\nExample: 2020 Ford F-150 5.5 ft bed XLT");
-      sess.flags.askedFitmentOnce = true;
-      pushHistory(sess, "assistant", ask);
-      return res.status(200).json({ reply: ask });
-    }
-
-    // Compose system prompt + history
+    // System prompt with friendlier brand voice
     const systemPrompt = `
-You are "Trucks Helper" — a precise, friendly truck expert.
-- Be concise and skimmable: 1–3 sentences per idea, separate ideas with blank lines.
-- When asked "how to", give clear steps + safety notes first.
-- Use the known vehicle profile for fitment/product guidance.
-- Ask at most ONE follow-up for missing fitment (only if 2+ core fields are missing).
-- If only ONE core field is missing, answer anyway and add a single soft ask at the end.
-- Do not paste URLs; the system injects links afterwards.
-- Tone: practical, human.`;
+You are "Trucks Helper" — a friendly, practical truck expert with a crisp, human tone.
+Style:
+- Short lines, easy to skim. Prefer bullets. Use a few emojis tastefully (e.g., 🚚, 👍, 👇).
+- Be specific and confident; avoid generic filler.
+- For HOW-TO: give clear, numbered or bulleted steps plus safety notes; then offer parts help.
+- Use known vehicle details automatically; DO NOT re-ask for year/make/model if already known.
+- If some fitment info is missing, ask ONCE, politely.
+- Do not put raw URLs in your text — links are injected later by the server.
+- Keep brand voice: helpful, no hard sell; suggest next step to keep the chat flowing.`;
 
     const isHowTo = looksLikeHowTo(message);
     const base = [{ role:"system", content:systemPrompt }, ...sess.history];
@@ -337,79 +302,151 @@ You are "Trucks Helper" — a precise, friendly truck expert.
       messages: base
     });
 
-    let replyRaw = r?.choices?.[0]?.message?.content
-      || "I couldn’t find a clear answer.";
+    let reply = r?.choices?.[0]?.message?.content
+      || "Here to help. Share what you’re working on and I’ll jump in. 👍";
 
-    // Small-liners formatting first
-    let reply = toSmallLines(replyRaw);
-
-    // Product-type heuristic for link seeding
-    const low = message.toLowerCase();
+    // Product-type routing (for better search seeds)
     let productType = null;
-    if (isHowTo && /brake|pad|rotor/.test(low)) productType = "brake pads";
-    else if (/brake pad|brakes|rotor/.test(low)) productType = "brake pads";
-    else if (/tonneau|bed cover/.test(low)) productType = "tonneau cover";
-    else if (/lift kit|leveling/.test(low)) productType = "lift kit";
-    else if (/tire|all terrain|mud terrain/.test(low)) productType = "tires";
-    else if (/tuner|programmer|diablosport|hypertech|hyper tuner/.test(low)) productType = "tuner";
-    else if (/(nerf bar|nerf bars|running board|running boards|side step|side steps|step bar|step bars|power ?step|rock slider|rock sliders)/i.test(low)) productType = "running boards";
+    const m = message.toLowerCase();
+    if (isHowTo && /brake|pad|rotor/.test(m)) productType = "brake pads";
+    else if (/brake pad|brakes|rotor/.test(m)) productType = "brake pads";
+    else if (/tonneau|bed cover/.test(m)) productType = "tonneau cover";
+    else if (/lift kit|leveling/.test(m)) productType = "lift kit";
+    else if (/tire|all terrain|mud terrain/.test(m)) productType = "tires";
+    else if (/tuner|programmer|diablosport|hypertech|hyper tuner/.test(m)) productType = "tuner";
+    else if (/(nerf bar|nerf bars|running board|running boards|side step|side steps|step bar|step bars|power ?step|rock slider|rock sliders)/i.test(m)) productType = "running boards";
 
-    // Build product queries (before footer)
-    let queries = extractProductQueries({ userMsg: message, modelReply: replyRaw, vehicle, productType, max: 4 });
+    // Build product queries
+    let queries = extractProductQueries({ userMsg: message, modelReply: reply, vehicle, productType, max: 4 });
 
     // Fallback seed if clearly shopping
-    if (!queries.length && (isProductLike(message) || isProductLike(replyRaw))) {
-      const veh = hasCore ? `${vehicle.year} ${vehicle.make} ${vehicle.model}` : "";
+    if (!queries.length && (isProductLike(message) || isProductLike(reply))) {
+      const veh = [vehicle?.year, vehicle?.make, vehicle?.model].filter(Boolean).join(" ");
       const seedType = productType || "truck accessories";
       queries = [veh ? `${veh} ${seedType}` : seedType];
     }
 
     // Inject links if any queries
+    let withLinks = reply;
     if (queries.length) {
-      reply = injectAffiliateLinks(
+      withLinks = injectAffiliateLinks(
         reply,
         queries.map(q => ({ name:q, url: buildAmazonSearchURL(q, { marketplace }) }))
       );
-      const lines = queries.map(q => tinySearchLine(q, marketplace)).join("<br>");
-      reply = `${reply}<br><br>${toSmallLines("You might consider:")}<br>${lines}<br>${toSmallLines("As an Amazon Associate, we may earn from qualifying purchases.")}`;
+      const lines = queries.map(q => tinySearchLine(q, marketplace));
+      withLinks = `${withLinks}
+
+You might consider:
+${lines.join("\n")}
+As an Amazon Associate, we may earn from qualifying purchases.`;
     }
 
-    // Soft ask ONLY if exactly one core field is missing (we answered already)
-    if (!hasCore && missingFitment(vehicle).length === 1 && !sess.flags.askedFitmentOnce) {
-      const one = missingFitment(vehicle)[0];
-      reply += `<br><br>${toSmallLines(`What’s your **${one}**? That lets me verify exact fitment.`)}`;
-      sess.flags.askedFitmentOnce = true;
-    }
+    // Add a friendly follow-up (never refit ask if we already know)
+    const follow = followUp(vehicle, message, productType);
 
-    // Natural follow-up to keep convo going
-    if (isHowTo && !sess.flags.offeredAfterHowTo) {
-      reply += `<br><br>${toSmallLines("Want me to pull **parts that fit your vehicle** for this job?")}`;
-      sess.flags.offeredAfterHowTo = true;
-      sess.flags.lastTopic = productType || sess.flags.lastTopic || "project";
-    } else {
-      const follow = productType
-        ? `Do you want me to compare a few **${productType}** options for your${hasCore ? ` ${vehicle.year} ${vehicle.make} ${vehicle.model}` : ""}?`
-        : looksLikeHowTo(message)
-          ? "Do you already have tools and torque specs, or should I list them?"
-          : "Want quick fitment checks or price ranges for that?";
-      reply += `<br><br>${toSmallLines(follow)}`;
-      if (productType) sess.flags.lastTopic = productType;
+    // Convert to small lines (bullets) while preserving links/footer
+    const [core, ...tail] = withLinks.split("\n\nYou might consider:");
+    let small = smallify(core);
+    if (tail.length) {
+      small += "\n\nYou might consider:" + tail.join("\n\nYou might consider:");
     }
+    small += `\n\n${follow}`;
 
-    pushHistory(sess, "assistant", reply);
-    return res.status(200).json({ reply });
+    pushHistory(sess, "assistant", small);
+    return res.status(200).json({ reply: small });
 
   } catch (e) {
     console.error("[/chat] error", e?.response?.data || e.message || e);
     return res.status(200).json({
-      reply: toSmallLines("I’m having trouble reaching the AI right now.\n\nShare your truck year, make, and model — I’ll fetch exact parts that fit.")
+      reply: "• I’m having trouble reaching the AI right now.\n• If you share your **year, make, model**, I’ll fetch parts that fit as soon as I’m back. 👍"
     });
   }
 });
 
-/* ---------------- Widget demo (optional) ---------------- */
-app.get("/health", (_req,res)=>res.send("ok"));
-app.get("/widget", (_req,res)=>res.type("html").send("<html><body>OK</body></html>"));
+/* ---------------- Optional: lightweight embeddable widget page ----------------
+   Keep this if you’re using /widget in an <iframe> or AMP <amp-iframe>.
+-------------------------------------------------------------------------------*/
+app.get("/widget", (_req, res) => {
+  res.type("html").send(`<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Truck Assistant</title>
+<style>
+:root{--bg:#0b0f14;--panel:#111923;--border:#213040;--accent:#1f6feb;--text:#e6edf3;--muted:#9bbcff}
+html,body{margin:0;height:100%}body{background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,Roboto;display:flex;flex-direction:column}
+header{display:flex;gap:10px;align-items:center;padding:12px;background:var(--panel);border-bottom:1px solid var(--border)}
+header .logo{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--accent);font-size:16px}
+#msgs{flex:1;overflow:auto;padding:12px}
+.msg{margin:8px 0}.who{font-size:11px;opacity:.7;margin-bottom:4px}
+.bubble{background:#141a22;border:1px solid var(--border);border-radius:12px;padding:10px 12px;white-space:pre-wrap}
+.me .bubble{background:rgba(31,111,235,.1);border-color:#2a3b52}
+form{display:flex;gap:8px;padding:10px;background:var(--panel);border-top:1px solid var(--border)}
+input{flex:1;border:1px solid #2a3b52;border-radius:10px;background:var(--bg);color:var(--text);padding:10px}
+button{border:0;border-radius:10px;background:var(--accent);color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}
+footer{font-size:11px;text-align:center;opacity:.7;padding:6px 10px}
+a{color:var(--muted);text-decoration:underline}
+.think{font-size:12px;opacity:.7;margin:4px 0 0 0}
+</style>
+<header><div class="logo">🚚</div><div><strong>AI Truck Assistant</strong></div></header>
+<main id="msgs"></main>
+<footer>As an Amazon Associate, we may earn from qualifying purchases.</footer>
+<form id="f" autocomplete="off">
+  <input id="q" placeholder="Ask about F-150 lifts, tires, covers…">
+  <button type="submit">Send</button>
+</form>
+<script>
+(() => {
+  const API = "/chat";
+  const $m = document.getElementById('msgs');
+  const $f = document.getElementById('f');
+  const $q = document.getElementById('q');
+  const SESS = (Math.random().toString(36).slice(2)) + Date.now();
 
-/* ---------------- Start ---------------- */
-app.listen(PORT, () => console.log(`🚀 Truckbot running with sticky fitment memory on :${PORT}`));
+  function add(role, html){
+    const d=document.createElement('div'); d.className='msg '+(role==='You'?'me':'ai');
+    d.innerHTML='<div class="who">'+role+'</div><div class="bubble">'+html+'</div>';
+    $m.appendChild(d); $m.scrollTop=$m.scrollHeight;
+    try{ parent.postMessage({type:'embed-size',height:document.body.scrollHeight},'*'); }catch(e){}
+    d.querySelectorAll('a[href]').forEach(a=>{a.target='_blank'; a.rel='nofollow sponsored noopener';});
+    return d;
+  }
+  function addThinking(){
+    const d=document.createElement('div'); d.className='msg ai';
+    const bubble=document.createElement('div'); bubble.className='bubble';
+    const status=document.createElement('div'); status.className='think'; status.textContent='Thinking…';
+    bubble.textContent='…';
+    bubble.appendChild(status);
+    d.appendChild(bubble); $m.appendChild(d); $m.scrollTop=$m.scrollHeight;
+    const steps=['Thinking…','Analyzing your question…','Checking fitment…','Exploring best options…','Composing answer…'];
+    let i=0; const id=setInterval(()=>{ status.textContent=steps[i++%steps.length]; }, 1200);
+    return {node:d, stop:()=>clearInterval(id)};
+  }
+
+  add('AI',"• Hi! I'm your AI truck helper.\n• Ask me anything — parts, fitment, or step-by-step how-to. 👍");
+
+  $f.addEventListener('submit', async e=>{
+    e.preventDefault();
+    const text=$q.value.trim(); if(!text) return;
+    add('You', text); $q.value='';
+    const th=addThinking();
+
+    try{
+      const r=await fetch(API,{method:'POST',headers:{'Content-Type':'application/json'},mode:'cors',credentials:'omit',
+        body: JSON.stringify({ message:text, session:SESS })});
+      let data; const ct=(r.headers.get('content-type')||'').toLowerCase();
+      if(ct.includes('application/json')) data=await r.json();
+      else data={ reply:'• Server returned a non-JSON response.' };
+      th.stop(); th.node.remove();
+      add('AI', (data && data.reply) ? data.reply : '• Sorry — no response right now.');
+    }catch(err){
+      th.stop(); th.node.remove();
+      add('AI',"• Can’t reach the AI (network/CORS).\n• Please try again in a moment.");
+    }
+  });
+})();
+</script>
+</html>`);
+});
+
+/* ---------------- Start server ---------------- */
+app.listen(PORT, () => console.log(`🚀 Truckbot running on :${PORT}`));
