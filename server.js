@@ -1,21 +1,15 @@
 // server.js — Chat + memory + auto-linking (category & product phrases) + small-liner tone
-// - Remembers vehicle per session (year/make/model/bed/trim/engine) — no repeat ask when known
-// - Answers in short lines, friendly brand voice
-// - HOW-TO: steps first; then a gentle "Want parts that fit?" follow-up
+// - Remembers vehicle per session (year/make/model/bed/trim/engine) — no repeat ask once known
+// - Short, friendly answers + follow-ups
 // - Auto-hyperlinks ANY detected product/category phrase to Amazon search with your affiliate tag
 // - Vehicle-aware search seeds (e.g., "2020 Ford F-150 cold air intake")
 // - Robust CORS incl. AMP viewer; /health, /echo, /diag
-// - /widget demo with iOS-friendly "Send"
-// ENV: OPENAI_API_KEY, MODEL, PORT, ALLOWED_ORIGINS, AFFILIATE_TAG, AMAZON_MARKETPLACE
+// - Embeddable /widget demo with iOS-friendly "Send"
 
 import "dotenv/config";
 import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
-
-// If you have your own extractor, keep it; otherwise it's fine.
-let extractIntent = null;
-try { ({ extractIntent } = await import("./recommend.js")); } catch { /* optional */ }
 
 const app = express();
 app.use(bodyParser.json({ limit: "1mb" }));
@@ -43,7 +37,8 @@ app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
-    res.setHeader("Access-Control-Allow-Credentials", "false"); // we pass session in body, not cookies
+    // We pass a session id in the body, not cookies
+    res.setHeader("Access-Control-Allow-Credentials", "false");
   }
   // AMP viewer/caches require these headers
   const ampSource = req.query.__amp_source_origin || req.headers["amp-source-origin"];
@@ -219,20 +214,32 @@ function harvestProductPhrases(text=""){
     const phrase = m[1].trim()
       .replace(/\s{2,}/g," ")
       .replace(/[.,;:)\]]+$/,"");
-    // Heuristic filters: skip obviously generic starters
     if (/^(Here|These|Those|This|That|Popular|Great|Best|Safety|Next)$/i.test(phrase)) continue;
-    // include words that look like producty (Series|Kit|FORCE|Air|Intake|MX4|Ultra|EFX|Gen|Pro etc.)
     if (!/[A-Za-z]/.test(phrase)) continue;
     hits.add(phrase);
   }
   return [...hits];
 }
 
-/* ---------------- Link injection (vehicle-aware; no whitelist) ---------------- */
+/* ---------------- Escaping + link helpers ---------------- */
+function escapeHtml(s = "") {
+  return s.replace(/[&<>"']/g, (ch) => {
+    const map = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    };
+    return map[ch] || ch;
+  });
+}
+
 function buildVehicleAwareQuery(vehicle, q){
   const veh = vehicleString(vehicle);
   return [veh, q].filter(Boolean).join(" ").trim();
 }
+
 function linkify(replyText, queriesWithUrls, maxLinks=8){
   if(!replyText) return replyText;
   let out = replyText;
@@ -274,10 +281,7 @@ function buildSearchQueries({ userMsg, modelReply, vehicle, marketplace, max=6 }
   for (const p of harvestProductPhrases(modelReply||"")) seeds.add(p);
 
   // Also add category seeds (vehicle-aware)
-  for (const c of cats) {
-    seeds.add(c);
-    // If category includes variations (e.g., "cold air intake"), keep as is
-  }
+  for (const c of cats) seeds.add(c);
 
   // Deduplicate by lowercase
   const list = [];
@@ -290,14 +294,13 @@ function buildSearchQueries({ userMsg, modelReply, vehicle, marketplace, max=6 }
     if (list.length >= 24) break; // generous pool; we'll trim later
   }
 
-  // Convert to vehicle-aware Amazon URLs
   const tag = process.env.AFFILIATE_TAG || "";
   const queries = list.slice(0, 32).map(q => {
     const vehQ = buildVehicleAwareQuery(vehicle, q);
     return { name: q, url: buildAmazonSearchURL(vehQ, { tag, marketplace }) };
   });
 
-  // Prefer category-first + proper names next
+  // Score: category-first, then "producty" tokens, then alphanum mixes
   const catSet = new Set(cats);
   const scored = queries.map(q => ({
     ...q,
@@ -311,15 +314,13 @@ function buildSearchQueries({ userMsg, modelReply, vehicle, marketplace, max=6 }
   return scored.slice(0, max);
 }
 
-function tinySearchLines(queries, marketplace){
+function tinySearchLines(queries){
   return queries.map(q => {
     const u = q.url;
     const label = q.name;
     return `• ${escapeHtml(label)} 👉 <a href="${u}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
   }).join("\n");
 }
-
-function escapeHtml(s=""){return s.replace(/[&<>"]/g, m => ({'&':'&','<':'<','>':'>','"':'"'}[m]);}
 
 /* ---------------- Yes/No helper ---------------- */
 function saidYes(s=""){ return /\b(yes|yeah|yup|sure|ok|okay|pls|please do|go ahead|why not)\b/i.test(s); }
@@ -346,6 +347,7 @@ app.post("/chat", async (req, res) => {
   try {
     const { message, session, country:bodyCountry, market:bodyMarket } = req.body || {};
     if (!message || typeof message !== "string") {
+      res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({ reply: "• Tell me what you’d like help with (parts, fitment, or a how-to)." });
     }
 
@@ -356,11 +358,8 @@ app.post("/chat", async (req, res) => {
 
     pushHistory(sess, "user", message);
 
-    // Try custom extractor, then regex overlay
-    let parsed = {};
-    try { parsed = extractIntent ? (extractIntent(message || "") || {}) : {}; } catch { parsed = {}; }
-    parsed.text = message;
-    const vehicle = mergeVehicleMemory(sess, parsed);
+    // Parse via lightweight regex overlay
+    const vehicle = mergeVehicleMemory(sess, { text: message });
 
     // Timed gentle ask if user said yes but we lack core fitment
     if (saidYes(message) && !fitmentKnown(vehicle)) {
@@ -369,6 +368,7 @@ app.post("/chat", async (req, res) => {
         const ask = "• Great — what’s your **year, make, and model**? (e.g., 2020 Ford F-150 5.5 ft bed XLT)";
         sess.flags.lastFitmentAskAt = now;
         pushHistory(sess, "assistant", ask);
+        res.setHeader("Cache-Control", "no-store");
         return res.status(200).json({ reply: ask });
       }
     }
@@ -381,6 +381,7 @@ app.post("/chat", async (req, res) => {
       sess.flags.askedFitmentOnce = true;
       sess.flags.lastFitmentAskAt = Date.now();
       pushHistory(sess, "assistant", ask);
+      res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({ reply: ask });
     }
 
@@ -419,7 +420,7 @@ Style:
       linked = `${linked}
 
 You might consider:
-${tinySearchLines(queries, marketplace)}
+${tinySearchLines(queries)}
 As an Amazon Associate, we may earn from qualifying purchases.`;
     }
 
@@ -430,7 +431,6 @@ As an Amazon Associate, we may earn from qualifying purchases.`;
     small += `\n\n${followUp(vehicle, message)}`;
 
     pushHistory(sess, "assistant", small);
-    // Optional: prevent caches from storing chat
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({ reply: small });
 
@@ -464,7 +464,7 @@ button{border:0;border-radius:10px;background:var(--accent);color:#fff;padding:1
 footer{font-size:11px;text-align:center;opacity:.7;padding:6px 10px}
 a{color:var(--muted);text-decoration:underline}
 .think{font-size:12px;opacity:.7;margin:4px 0 0 0}
-.chat-footer{position:sticky;bottom:0;padding:8px calc(8px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(8px + env(safe-area-inset-left));background:#111923}
+.chat-footer{position:sticky;bottom:0;padding:8px calc(8px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(8px + env(safe-area-inset-left));background:#111923;z-index:10000}
 .app{min-height:100dvh;display:flex;flex-direction:column}
 </style>
 <header><div class="logo">🚚</div><div><strong>AI Truck Assistant</strong></div></header>
@@ -503,7 +503,7 @@ a{color:var(--muted);text-decoration:underline}
     return {node:d, stop:()=>clearInterval(id)};
   }
 
-  add('AI',"• Hi! I'm your AI truck helper.\n• Ask me anything — parts, fitment, or step-by-step how-to. 👍");
+  add('AI',"• Hi! I'm your AI truck helper.\\n• Ask me anything — parts, fitment, or step-by-step how-to. 👍");
 
   // iOS tap reliability
   $btn.addEventListener('touchstart', () => {}, { passive:true });
@@ -524,7 +524,7 @@ a{color:var(--muted);text-decoration:underline}
       add('AI', (data && data.reply) ? data.reply : '• Sorry — no response right now.');
     }catch(err){
       th.stop(); th.node.remove();
-      add('AI',"• Can’t reach the AI (network/CORS).\n• Please try again in a moment.");
+      add('AI',"• Can’t reach the AI (network/CORS).\\n• Please try again in a moment.");
     } finally {
       $btn.disabled=false; $q.focus();
     }
