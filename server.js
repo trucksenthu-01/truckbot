@@ -1,4 +1,4 @@
-// server.js — Chat + memory + realistic follow-ups + guarded product links + GEO (US/UK/CA)
+// server.js — Chat + memory + realistic follow-ups + safe product links (no re-match in URLs) + GEO
 // - Strong CORS (Android/AMP-safe), OPTIONS preflight
 // - Remembers vehicle per session (year/make/model/etc.)
 // - Short, skimmable answers; open-ended follow-ups
@@ -128,7 +128,6 @@ function escapeHtml(s = "") {
 }
 
 /* ---------------- Product intent (brand-agnostic) ---------------- */
-// Category vocabulary
 const CATEGORY_TERMS = [
   "cold air intake","air intake","intake","intake kit","intake filter","air filter",
   "tonneau cover","bed cover","retractable tonneau","tri-fold tonneau","hard folding cover","soft roll-up cover",
@@ -147,15 +146,14 @@ function detectCategories(text=""){
   return [...set];
 }
 
-// Generic phrases that should NEVER be linkified
 const NON_PRODUCT_PHRASES = [
   "determine compatibility","choose type","research brands","read reviews",
   "compare prices","check features","warranty & support","warranty and support",
-  "safety notes","installation","backup","legal compliance",
-  "compatibility","choose type","research","read","compare","check","warranty","support","safety","legal"
+  "safety notes","installation","backup","legal compliance","compatibility",
+  "choose type","research","read","compare","check","warranty","support","safety","legal",
+  "best" // drop generic "best ..."
 ];
 
-// Tokens that make a phrase look “producty”
 const PRODUCT_TOKENS = [
   "series","kit","intake","filter","pads","rotors","brake","cover","shocks","struts","coilover","springs",
   "tuner","programmer","exhaust","muffler","header","cat-back","nerf","board","boards","steps","step","slider","sliders",
@@ -163,21 +161,25 @@ const PRODUCT_TOKENS = [
   "bar","light","lights","led","winch","hitch","battery"
 ];
 
-// Capture 2–7 token Capitalized phrases (e.g., “K&N 63 Series Aircharger”)
+const MAKES = ["ford","chevrolet","chevy","gmc","ram","dodge","toyota","nissan","jeep","honda","subaru"];
+
+// 2–7 token Capitalized phrases (e.g., “K&N 63 Series Aircharger”)
 const PROD_PHRASE_RE = /\b([A-Z][A-Za-z0-9&\-]+(?:\s+[A-Z0-9][A-Za-z0-9&\-]+){1,6})\b/g;
 
-// Decide if a candidate phrase is truly product-like
+function looksLikeVehicleOnly(phrase=""){
+  const lc = phrase.toLowerCase();
+  if (/\b(19|20)\d{2}\b/.test(lc) && MAKES.some(m=>lc.includes(m))) return true; // year + make
+  if (/(f[\s-]?150|silverado|sierra|tacoma|tundra|ranger|ram\s?1500|gladiator|maverick|colorado|frontier)/i.test(phrase) && MAKES.some(m=>lc.includes(m))) return true;
+  return false;
+}
+
 function isProductishPhrase(phrase=""){
   const lc = phrase.toLowerCase();
-
-  // drop obvious non-product phrases
   if (NON_PRODUCT_PHRASES.some(p => lc.includes(p))) return false;
-
-  // must contain at least one product token (single or multi-word) OR alphanum mix (e.g., "63 Series", "MX4")
+  if (looksLikeVehicleOnly(lc)) return false;               // skip pure vehicle strings
   const hasToken = PRODUCT_TOKENS.some(tok => lc.split(/\s+/).includes(tok)) ||
                    ["cold air intake","light bar","bed liner","floor mats","cat-back"].some(t => lc.includes(t));
   const hasAlphaNumMix = /\b(?:[a-z]*\d+[a-z]+|[a-z]+[0-9]+)\b/i.test(phrase) || /&/.test(phrase);
-
   return hasToken || hasAlphaNumMix;
 }
 
@@ -200,7 +202,7 @@ function isShoppingIntent(text=""){
   return /\b(cover|intake|kit|pads?|rotors?|brake|shocks?|struts?|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter)\b/i.test(text);
 }
 
-/* ---------------- Link injection (safe; products only) ---------------- */
+/* ---------------- Link injection (safe; never re-match inside URLs) ---------------- */
 function stripMarkdownBasic(s=""){return s
   .replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1")
   .replace(/^#+\s*(.+)$/gm,"$1").replace(/!\[[^\]]*\]\([^)]+\)/g,"")
@@ -212,30 +214,38 @@ function buildOrderedTokenRegex(name){ const ts=_toks(name); if(!ts.length) retu
   const chosen=ts.slice(0,Math.min(3,ts.length)); const pattern=chosen.map(t=>`(${t})`).join(`\\s+`);
   return new RegExp(`\\b${pattern}\\b`,"gi"); }
 
+function protectAnchors(text){
+  const anchors=[]; const out=text.replace(/<a\b[^>]*>.*?<\/a>/gi, m=>{ anchors.push(m); return `__A${anchors.length-1}__`; });
+  return { out, anchors };
+}
+function restoreAnchors(text, anchors){ return text.replace(/__A(\d+)__/g, (_,i)=>anchors[+i]); }
+
 function injectAffiliateLinks(replyText="", products=[]) {
   if(!replyText || !products?.length) return replyText;
   let out = stripMarkdownBasic(replyText);
 
-  // Keep existing anchors intact
-  const anchors = [];
-  out = out.replace(/<a\b[^>]*>.*?<\/a>/gi, (m) => { anchors.push(m); return `__A${anchors.length-1}__`; });
-
-  for(const p of products){
+  // Do replacements one-by-one, protecting anchors each time,
+  // so we never match inside href URLs added by a previous replacement.
+  for (const p of products){
     const url=p?.url, full=p?.name; if(!url||!full) continue;
-    const tokenRe=buildOrderedTokenRegex(full);
-    if(tokenRe && tokenRe.test(out)){
-      out = out.replace(tokenRe, m=>`<a href="${url}" target="_blank" rel="nofollow sponsored noopener">${m}</a>`);
-      continue;
-    }
-    const esc = full.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
-    const exactRe = new RegExp(`\\b(${esc})\\b`, "gi");
-    if(exactRe.test(out)){
-      out = out.replace(exactRe, `<a href="${url}" target="_blank" rel="nofollow sponsored noopener">$1</a>`);
-    }
-  }
 
-  // Restore anchors
-  out = out.replace(/__A(\d+)__/g, (_,i)=>anchors[+i]);
+    // protect current anchors
+    let { out: noA, anchors } = protectAnchors(out);
+
+    const tokenRe=buildOrderedTokenRegex(full);
+    if(tokenRe && tokenRe.test(noA)){
+      noA = noA.replace(tokenRe, m=>`<a href="${url}" target="_blank" rel="nofollow sponsored noopener">${m}</a>`);
+    } else {
+      const esc = full.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+      const exactRe = new RegExp(`\\b(${esc})\\b`, "gi");
+      if(exactRe.test(noA)){
+        noA = noA.replace(exactRe, `<a href="${url}" target="_blank" rel="nofollow sponsored noopener">$1</a>`);
+      }
+    }
+
+    // restore anchors and continue to next product
+    out = restoreAnchors(noA, anchors);
+  }
   return out;
 }
 
@@ -250,19 +260,16 @@ function buildQueryItems({ userMsg, modelReply, vehicle, max=6 }){
   const items = [];
   const seen = new Set();
 
-  // categories -> display category; query includes vehicle
   for (const c of detectCategories(userMsg||"")) {
-    const key = `cat:${c.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
+    const key = `cat:${c}`; if (seen.has(key)) continue; seen.add(key);
     items.push({ display: c, query: buildVehicleAwareQuery(vehicle, c) });
     if (items.length >= max) return items;
   }
   for (const c of detectCategories(modelReply||"")) {
-    const key = `cat:${c.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
+    const key = `cat:${c}`; if (seen.has(key)) continue; seen.add(key);
     items.push({ display: c, query: buildVehicleAwareQuery(vehicle, c) });
     if (items.length >= max) return items;
   }
-
-  // product phrases -> display phrase; query includes vehicle
   for (const p of harvestProductPhrases(userMsg||"")) {
     const key = `p:${p.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
     items.push({ display: p, query: buildVehicleAwareQuery(vehicle, p) });
@@ -273,7 +280,6 @@ function buildQueryItems({ userMsg, modelReply, vehicle, max=6 }){
     items.push({ display: p, query: buildVehicleAwareQuery(vehicle, p) });
     if (items.length >= max) return items;
   }
-
   return items;
 }
 
@@ -360,12 +366,11 @@ No raw URLs; links are injected later.`;
     let reply = r?.choices?.[0]?.message?.content
       || (isGreetingOrSmallTalk(message) ? "• Hi! How can I help today?" : "• Tell me what you’re working on and I’ll jump in.");
 
-    // === Only attach affiliate links when it's truly product intent ===
+    // Only attach affiliate links when it's truly product intent
     if (!isGreetingOrSmallTalk(message)) {
       const items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 6 });
 
       if (items.length) {
-        // Link inside the body using product display names
         const linkTargets = items.map(it => ({
           name: it.display,
           url: buildAmazonSearchURL(it.query, { marketplace })
@@ -393,7 +398,7 @@ As an Amazon Associate, we may earn from qualifying purchases.`;
       small = "• Hi! How can I help today?\n\n• Parts, fitment, or a quick how-to?";
     }
 
-    // Add “upsell after HOW-TO” once (kept from your original)
+    // “Upsell after HOW-TO” once
     if (isHowTo && !sess.flags.offeredUpsellAfterHowTo) {
       small += `\n• Want me to fetch parts lists or torque specs?`;
       sess.flags.offeredUpsellAfterHowTo = true;
