@@ -1,10 +1,11 @@
 // server.js — Chat + memory + small-liner tone + friendly follow-ups + guarded links + robust CORS
-// - Remembers vehicle per session (year/make/model/etc.) — no repeat ask when known
+// - Remembers vehicle per "session" (year/make/model/bed/trim/engine); won’t repeat ask once known
 // - Answers in short lines (bulleted), brand-friendly tone
 // - HOW-TO: steps first, then a natural "Want parts that fit?" follow-up
 // - Shopping: adds Amazon search links (affiliate + GEO marketplace), never overlinks
 // - Strong CORS (Android/AMP/webviews), OPTIONS preflight
-// - /widget still available if you embed it; /health & /echo for diagnostics
+// - /widget stays available; /health, /echo, and /diag for diagnostics
+// - Built-in vehicle extractors (regex) so we don’t depend solely on recommend.js
 
 import "dotenv/config";
 import express from "express";
@@ -39,6 +40,7 @@ app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+    // NOTE: client uses credentials:"omit"; keep false to avoid cookie warnings across iframes
     res.setHeader("Access-Control-Allow-Credentials", "false");
   }
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -50,7 +52,7 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MODEL  = process.env.MODEL || "gpt-4o-mini";
 const PORT   = process.env.PORT || 3000;
 
-/* ---------------- Session memory ---------------- */
+/* ---------------- Session memory (Map keyed by caller-provided "session") ---------------- */
 const SESSIONS = new Map(); // sessionId -> { history, vehicle, flags }
 const MAX_TURNS = 18;
 
@@ -58,7 +60,7 @@ function getSession(sessionId) {
   if (!SESSIONS.has(sessionId)) {
     SESSIONS.set(sessionId, {
       history: [],
-      vehicle: {}, // {year, make, model, bed, trim, engine}
+      vehicle: { year:null, make:null, model:null, bed:null, trim:null, engine:null },
       flags: {
         askedFitmentOnce: false,
         offeredUpsellAfterHowTo: false,
@@ -75,30 +77,96 @@ function pushHistory(sess, role, content) {
   }
 }
 
-/* ---------------- Utilities ---------------- */
-const HOWTO_KEYWORDS = [
-  "how to","how do i","procedure","steps","install","replace","change","fix","tutorial","guide"
+/* ---------------- Lightweight extractors (add-on to your recommend.js) ---------------- */
+const KNOWN_MAKES = ["Ford","Ram","Dodge","Chevrolet","Chevy","GMC","Toyota","Nissan","Jeep"];
+const MODEL_HINTS = [
+  "F-150","F150","F 150","Silverado","Sierra","Tacoma","Tundra","Ranger",
+  "Ram 1500","Ram1500","Gladiator","Maverick","Colorado","Frontier"
 ];
-function looksLikeHowTo(s=""){const t=s.toLowerCase();return HOWTO_KEYWORDS.some(k=>t.includes(k));}
+
+function pullYear(text=""){
+  const m = text.match(/\b(20\d{2}|19\d{2})\b/);
+  if (!m) return null;
+  const y = parseInt(m[1], 10);
+  return (y>=1990 && y<=2030) ? String(y) : null;
+}
+function pullMake(text=""){
+  for (const make of KNOWN_MAKES) {
+    const re = new RegExp(`\\b${make}\\b`, "i");
+    if (re.test(text)) return make === "Chevy" ? "Chevrolet" : make;
+  }
+  return null;
+}
+function pullModel(text=""){
+  for (const hint of MODEL_HINTS) {
+    const re = new RegExp(`\\b${hint}\\b`, "i");
+    if (re.test(text)) {
+      if (/f[\s-–]?150/i.test(hint)) return "F-150";
+      if (/ram\s?1500/i.test(hint)) return "Ram 1500";
+      return hint.replace(/\s+/g, " ");
+    }
+  }
+  return null;
+}
+function pullBed(text=""){
+  const ft = text.match(/(\d(?:\.\d)?)\s?('?ft|ft|'|feet)/i);
+  if (ft) return `${ft[1]} ft`;
+  if (/short\s*bed|crew\s*short/i.test(text)) return "5.5 ft";
+  if (/standard\s*bed|regular\s*bed|6(?!\.)\s?ft/i.test(text)) return "6.5 ft";
+  if (/long\s*bed|8\s?ft/i.test(text)) return "8 ft";
+  if (/wheel[-\s]?to[-\s]?wheel/i.test(text)) return "wheel-to-wheel (steps coverage)";
+  return null;
+}
+function pullTrim(text=""){
+  const TRIMS = ["XL","XLT","Lariat","King Ranch","Platinum","Limited","TRD","TRD Pro","Sport","STX","Raptor","Big Horn","Lone Star","Rebel","Laramie","Limited Longhorn","Trail Boss","Z71","AT4","Pro-4X","Rubicon","Overland","Sahara"];
+  for (const t of TRIMS) {
+    const re = new RegExp(`\\b${t}\\b`, "i");
+    if (re.test(text)) return t;
+  }
+  return null;
+}
 
 function mergeVehicleMemory(sess, from = {}) {
   const v = sess.vehicle || {};
-  const merged = {
-    year:   from.year   || v.year   || null,
-    make:   from.make   || v.make   || null,
-    model:  from.model  || v.model  || null,
-    bed:    from.bed    || v.bed    || null,
-    trim:   from.trim   || v.trim   || null,
-    engine: from.engine || v.engine || null,
+  const overlay = {
+    year:   from.year   ?? pullYear(from.text||""),
+    make:   from.make   ?? pullMake(from.text||""),
+    model:  from.model  ?? pullModel(from.text||""),
+    bed:    from.bed    ?? pullBed(from.text||""),
+    trim:   from.trim   ?? pullTrim(from.text||""),
+    engine: from.engine ?? null
   };
+
+  // Final normalized merge
+  const merged = {
+    year:   overlay.year   || v.year   || null,
+    make:   overlay.make   || v.make   || null,
+    model:  overlay.model  || v.model  || null,
+    bed:    overlay.bed    || v.bed    || null,
+    trim:   overlay.trim   || v.trim   || null,
+    engine: overlay.engine || v.engine || null,
+  };
+  // normalize: if model is F-150 but make missing, assume Ford
+  if (merged.model === "F-150" && !merged.make) merged.make = "Ford";
   sess.vehicle = merged; return merged;
 }
+
 function missingFitment(vehicle) {
-  const miss=[]; if(!vehicle.year) miss.push("year"); if(!vehicle.make) miss.push("make"); if(!vehicle.model) miss.push("model"); return miss;
+  const miss = [];
+  if (!vehicle.year)  miss.push("year");
+  if (!vehicle.make)  miss.push("make");
+  if (!vehicle.model) miss.push("model");
+  return miss;
 }
 function fitmentKnown(vehicle){ return !!(vehicle.year && vehicle.make && vehicle.model); }
 
 function saidYes(s=""){ return /\b(yes|yeah|yup|sure|ok|okay|pls|please do|go ahead|why not)\b/i.test(s); }
+
+/* ---------------- Utilities: HOW-TO detect ---------------- */
+const HOWTO_KEYWORDS = [
+  "how to","how do i","procedure","steps","install","replace","change","fix","tutorial","guide"
+];
+function looksLikeHowTo(s=""){const t=s.toLowerCase();return HOWTO_KEYWORDS.some(k=>t.includes(k));}
 
 /* ---------------- GEO -> marketplace ---------------- */
 const COUNTRY_TO_TLD_LIMITED = { US:"com", GB:"co.uk", UK:"co.uk", CA:"ca" };
@@ -195,18 +263,13 @@ function extractProductQueries({ userMsg, modelReply, vehicle, productType, max=
 function escapeHtml(s=""){return s.replace(/[&<>"]/g, m => ({'&':'&','<':'<','>':'>','"':'"'}[m]));}
 
 // Turn any model text into short, readable lines.
-// - Keep existing bullets/headers
-// - Don’t break anchor links
-// - Add "• " prefix where it reads as a list
 function smallify(html=""){
-  // If reply already contains anchor tags or explicit bullets, keep structure
   if (/<a\s/i.test(html)) {
     return html.split(/\n{2,}/).map(chunk=>{
       const lines = chunk.split(/\n/).map(s=>s.trim()).filter(Boolean);
       return lines.map(l=> l.startsWith("•") ? l : `• ${l}`).join("\n");
     }).join("\n\n");
   }
-  // Otherwise, sentence split → bullets
   const parts = html
     .replace(/\s+/g," ")
     .split(/(?<=[\.!?])\s+(?=[A-Z0-9])/)
@@ -238,6 +301,19 @@ function followUp(vehicle, userMsg, productType) {
 /* ---------------- Diagnostics ---------------- */
 app.get("/health", (_req,res)=>res.send("ok"));
 app.post("/echo", (req,res)=>res.json({ ok:true, origin:req.headers.origin||null, ua:req.headers["user-agent"]||null }));
+app.get("/diag", (req,res)=>{
+  const ua = req.get("user-agent") || "";
+  res.json({
+    ok:true,
+    time:new Date().toISOString(),
+    sessionCount: SESSIONS.size,
+    client:{
+      ua,
+      isIOS:/iPad|iPhone|iPod/i.test(ua),
+      isMobile:/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua),
+    }
+  });
+});
 
 /* ---------------- Chat ---------------- */
 app.post("/chat", async (req, res) => {
@@ -252,14 +328,19 @@ app.post("/chat", async (req, res) => {
     const sessionId = (session || "visitor").toString().slice(0, 60);
     const sess = getSession(sessionId);
 
-    // Update memory from this turn
+    // Update memory from this turn (keep original history behavior)
     pushHistory(sess, "user", message);
 
-    // Parse & merge vehicle profile
-    const parsed = extractIntent ? extractIntent(message||"") : {};
+    // 1) Try your custom extractor first (if present)
+    let parsed = {};
+    try { parsed = extractIntent ? (extractIntent(message || "") || {}) : {}; }
+    catch { parsed = {}; }
+
+    // 2) Merge with built-in regex extractors so we capture year/make/model/bed/trim even if extractor is light
+    parsed.text = message;
     const vehicle = mergeVehicleMemory(sess, parsed);
 
-    // If user said "yes" but fitment incomplete, gently ask (only once every 2 min)
+    // Gentle, timed ask when the user says "yes" but we lack core fitment
     if (saidYes(message) && !fitmentKnown(vehicle)) {
       const now=Date.now();
       if (now - (sess.flags.lastFitmentAskAt||0) > 120000) {
@@ -287,11 +368,11 @@ You are "Trucks Helper" — a friendly, practical truck expert with a crisp, hum
 Style:
 - Short lines, easy to skim. Prefer bullets. Use a few emojis tastefully (e.g., 🚚, 👍, 👇).
 - Be specific and confident; avoid generic filler.
-- For HOW-TO: give clear, numbered or bulleted steps plus safety notes; then offer parts help.
+- For HOW-TO: give clear, numbered/bulleted steps + safety notes; then offer parts help.
 - Use known vehicle details automatically; DO NOT re-ask for year/make/model if already known.
 - If some fitment info is missing, ask ONCE, politely.
 - Do not put raw URLs in your text — links are injected later by the server.
-- Keep brand voice: helpful, no hard sell; suggest next step to keep the chat flowing.`;
+- Keep brand voice: helpful, no hard sell; suggest a next step.`;
 
     const isHowTo = looksLikeHowTo(message);
     const base = [{ role:"system", content:systemPrompt }, ...sess.history];
@@ -326,7 +407,7 @@ Style:
       queries = [veh ? `${veh} ${seedType}` : seedType];
     }
 
-    // Inject links if any queries
+    // Inject links if queries exist
     let withLinks = reply;
     if (queries.length) {
       withLinks = injectAffiliateLinks(
@@ -341,7 +422,7 @@ ${lines.join("\n")}
 As an Amazon Associate, we may earn from qualifying purchases.`;
     }
 
-    // Add a friendly follow-up (never refit ask if we already know)
+    // Add a friendly follow-up (never re-asks fitment if we already know)
     const follow = followUp(vehicle, message, productType);
 
     // Convert to small lines (bullets) while preserving links/footer
@@ -363,13 +444,11 @@ As an Amazon Associate, we may earn from qualifying purchases.`;
   }
 });
 
-/* ---------------- Optional: lightweight embeddable widget page ----------------
-   Keep this if you’re using /widget in an <iframe> or AMP <amp-iframe>.
--------------------------------------------------------------------------------*/
+/* ---------------- Optional embeddable widget page ---------------- */
 app.get("/widget", (_req, res) => {
   res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>AI Truck Assistant</title>
 <style>
 :root{--bg:#0b0f14;--panel:#111923;--border:#213040;--accent:#1f6feb;--text:#e6edf3;--muted:#9bbcff}
@@ -386,13 +465,15 @@ button{border:0;border-radius:10px;background:var(--accent);color:#fff;padding:1
 footer{font-size:11px;text-align:center;opacity:.7;padding:6px 10px}
 a{color:var(--muted);text-decoration:underline}
 .think{font-size:12px;opacity:.7;margin:4px 0 0 0}
+.chat-footer{position:sticky;bottom:0;padding:8px calc(8px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(8px + env(safe-area-inset-left));background:#111923}
+.app{min-height:100dvh;display:flex;flex-direction:column}
 </style>
 <header><div class="logo">🚚</div><div><strong>AI Truck Assistant</strong></div></header>
 <main id="msgs"></main>
 <footer>As an Amazon Associate, we may earn from qualifying purchases.</footer>
-<form id="f" autocomplete="off">
-  <input id="q" placeholder="Ask about F-150 lifts, tires, covers…">
-  <button type="submit">Send</button>
+<form id="f" autocomplete="off" class="chat-footer">
+  <input id="q" placeholder="Ask about F-150 lifts, tires, covers…" inputmode="text" autocomplete="off">
+  <button id="sendBtn" type="submit" aria-label="Send">Send</button>
 </form>
 <script>
 (() => {
@@ -400,6 +481,7 @@ a{color:var(--muted);text-decoration:underline}
   const $m = document.getElementById('msgs');
   const $f = document.getElementById('f');
   const $q = document.getElementById('q');
+  const $btn = document.getElementById('sendBtn');
   const SESS = (Math.random().toString(36).slice(2)) + Date.now();
 
   function add(role, html){
@@ -424,10 +506,13 @@ a{color:var(--muted);text-decoration:underline}
 
   add('AI',"• Hi! I'm your AI truck helper.\n• Ask me anything — parts, fitment, or step-by-step how-to. 👍");
 
+  // iOS tap reliability
+  $btn.addEventListener('touchstart', () => {}, { passive:true });
+
   $f.addEventListener('submit', async e=>{
     e.preventDefault();
     const text=$q.value.trim(); if(!text) return;
-    add('You', text); $q.value='';
+    add('You', text); $q.value=''; $btn.disabled=true;
     const th=addThinking();
 
     try{
@@ -441,7 +526,17 @@ a{color:var(--muted);text-decoration:underline}
     }catch(err){
       th.stop(); th.node.remove();
       add('AI',"• Can’t reach the AI (network/CORS).\n• Please try again in a moment.");
+    } finally {
+      $btn.disabled=false; $q.focus();
     }
+  });
+
+  $q.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $f.requestSubmit(); }
+  });
+
+  $q.addEventListener('input', () => {
+    $btn.disabled = $q.value.trim().length === 0;
   });
 })();
 </script>
