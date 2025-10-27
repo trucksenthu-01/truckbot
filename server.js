@@ -2,9 +2,8 @@
 // - Strong CORS (Android/AMP-safe), OPTIONS preflight
 // - Remembers vehicle per session (year/make/model/etc.)
 // - HOW-TO answers first, then a natural follow-up offer
-// - If user says "yes", asks for vehicle details (if missing) and then links
-// - Amazon search links (affiliate tag + GEO marketplace)
-// - Fallback product search if intent is shopping-like
+// - Affiliate links only when it's clearly PRODUCT intent (not for "Hi")
+// - Fitment asked at most once per session
 // - /widget endpoint (for normal + AMP <amp-iframe>)
 
 import "dotenv/config";
@@ -95,6 +94,10 @@ function missingFitment(vehicle) {
 }
 function saidYes(s=""){ return /\b(yes|yeah|yup|sure|ok|okay|please do|go ahead|why not)\b/i.test(s); }
 
+/* ---------------- Detect greeting/small talk ---------------- */
+const GREET_RE = /^\s*(hi|hello|hey|yo|sup|hola|howdy|good\s*(morning|afternoon|evening))\b[\s!\.\?]*$/i;
+function isGreetingOrSmallTalk(text=""){ return GREET_RE.test(text) || text.trim().length < 2; }
+
 /* ---------------- GEO -> marketplace ---------------- */
 const COUNTRY_TO_TLD_LIMITED = { US:"com", GB:"co.uk", UK:"co.uk", CA:"ca" };
 function normalizeCountry(c){ if(!c) return null; const s=String(c).trim();
@@ -128,8 +131,7 @@ function tinySearchLine(q, market){
   return `• ${escapeHtml(q)} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
-/* ---------------- Brand-agnostic product/category detection ---------------- */
-// 1) Broad category vocabulary (no brand restriction)
+/* ---------------- Brand-agnostic product/category intent ---------------- */
 const CATEGORY_TERMS = [
   "cold air intake","air intake","intake","intake kit","intake filter","air filter",
   "tonneau cover","bed cover","retractable tonneau","tri-fold tonneau","hard folding cover","soft roll-up cover",
@@ -148,14 +150,13 @@ function detectCategories(text=""){
   return [...set];
 }
 
-// 2) Brand-agnostic product phrases (match ANY brand/product text like “K&N 63 Series Aircharger” or “aFe Magnum FORCE”)
+// Catch ANY brand/product phrase (e.g., “K&N 63 Series Aircharger”)
 const PROD_PHRASE_RE = /\b([A-Z][A-Za-z0-9&\-]+(?:\s+[A-Z0-9][A-Za-z0-9&\-]+){1,6})\b/g;
 function harvestProductPhrases(text=""){
   if (!text) return [];
   const hits = new Set(); let m;
   while ((m = PROD_PHRASE_RE.exec(text)) !== null) {
     const phrase = m[1].trim().replace(/\s{2,}/g," ").replace(/[.,;:)\]]+$/,"");
-    // skip obvious non-products
     if (/^(Here|These|Those|This|That|Popular|Great|Best|Safety|Next)$/i.test(phrase)) continue;
     if (!/[A-Za-z]/.test(phrase)) continue;
     hits.add(phrase);
@@ -163,7 +164,14 @@ function harvestProductPhrases(text=""){
   return [...hits];
 }
 
-/* ---------------- Link injection (use ANY product/category) ---------------- */
+function isShoppingIntent(text=""){
+  if (!text) return false;
+  if (detectCategories(text).length) return true;
+  if (harvestProductPhrases(text).length) return true;
+  return /\b(cover|intake|kit|pads?|rotors?|brake|shocks?|struts?|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter)\b/i.test(text);
+}
+
+/* ---------------- Link injection ---------------- */
 function stripMarkdownBasic(s=""){return s
   .replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1")
   .replace(/^#+\s*(.+)$/gm,"$1").replace(/!\[[^\]]*\]\([^)]+\)/g,"")
@@ -177,7 +185,6 @@ function buildOrderedTokenRegex(name){ const ts=_toks(name); if(!ts.length) retu
 
 function injectAffiliateLinks(replyText="", products=[]) {
   if(!replyText || !products?.length) return replyText;
-  // do NOT restrict by brand; link every product/category phrase
   let out = stripMarkdownBasic(replyText);
 
   // Keep existing anchors intact
@@ -203,58 +210,48 @@ function injectAffiliateLinks(replyText="", products=[]) {
   return out;
 }
 
-/* ---------------- Product detection + query extraction (brand-agnostic) ---------------- */
+/* ---------------- Query extraction (only if product intent) ---------------- */
 function vehicleString(v){ return [v?.year,v?.make,v?.model].filter(Boolean).join(" "); }
 function buildVehicleAwareQuery(vehicle, q) {
   const veh = vehicleString(vehicle);
   return [veh, q].filter(Boolean).join(" ").trim();
 }
 
-function extractProductQueries({ userMsg, modelReply, vehicle, productType, max=6 }){
+function extractProductQueries({ userMsg, modelReply, vehicle, max=6 }){
   const seeds = new Set();
 
-  // categories from both sides
+  // Strict: only derive seeds from categories/phrases (no generic "Hi")
   detectCategories(userMsg||"").forEach(c=>seeds.add(c));
   detectCategories(modelReply||"").forEach(c=>seeds.add(c));
-
-  // product phrases from both sides
   harvestProductPhrases(userMsg||"").forEach(p=>seeds.add(p));
   harvestProductPhrases(modelReply||"").forEach(p=>seeds.add(p));
 
-  // optional productType hint
-  if (productType) seeds.add(productType);
-
-  // always include the user's ask as a fallback query
-  if ((userMsg||"").trim()) seeds.add((userMsg||"").trim());
-
+  // Build vehicle-aware queries
   const out = [];
   for (const s of seeds) {
-    const q = buildVehicleAwareQuery(vehicle, s);
-    out.push(q);
+    out.push(buildVehicleAwareQuery(vehicle, s));
     if (out.length >= max) break;
   }
   return out;
 }
 
-/* ---------------- Diagnostics ---------------- */
-app.get("/health", (_req,res)=>res.send("ok"));
-app.post("/echo", (req,res)=>res.json({ ok:true, origin:req.headers.origin||null, ua:req.headers["user-agent"]||null }));
-
 /* ---------------- Small, skimmable lines + open-ended follow-up ---------------- */
 function toBullets(text=""){
-  // turn sentences into bullets; keep anchors and line breaks where present
   const parts = text.replace(/\s+/g," ").split(/(?<=[\.!?])\s+(?=[A-Z0-9])/).map(s=>s.trim()).filter(Boolean);
-  if (!parts.length) return text;
+  if (!parts.length) return text.startsWith("•") ? text : `• ${text}`;
   return parts.map(l => l.startsWith("•") ? l : `• ${l}`).join("\n");
 }
 function followUpLine(message, vehicle){
-  const isHowTo = looksLikeHowTo(message);
-  if (isHowTo) {
-    const v = vehicleString(vehicle);
-    return v ? "• Want me to pull parts that fit your setup?" : "• Want me to pull parts that fit your truck?";
+  if (looksLikeHowTo(message)) {
+    return vehicleString(vehicle) ? "• Want parts that fit your setup?" : "• Want parts that fit your truck?";
   }
-  return "• Want budget, brand picks, or install tips?";
+  if (isShoppingIntent(message)) return "• Want budget, brands, or install tips?";
+  return "• What are you working on today?";
 }
+
+/* ---------------- Diagnostics ---------------- */
+app.get("/health", (_req,res)=>res.send("ok"));
+app.post("/echo", (req,res)=>res.json({ ok:true, origin:req.headers.origin||null, ua:req.headers["user-agent"]||null }));
 
 /* ---------------- Chat ---------------- */
 app.post("/chat", async (req, res) => {
@@ -276,9 +273,9 @@ app.post("/chat", async (req, res) => {
     const parsed = extractIntent ? (extractIntent(message||"") || {}) : {};
     const vehicle = mergeVehicleMemory(sess, parsed);
 
-    // -------------- Change #2: ask fitment ONLY ONCE --------------
+    // Ask fitment ONCE per session if really needed
     const miss = missingFitment(vehicle);
-    const wantsProducts = /cover|intake|kit|pads|rotor|brake|shocks|struts|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter/i.test(message);
+    const wantsProducts = isShoppingIntent(message);
 
     if (!sess.flags.askedFitmentOnce) {
       if (saidYes(message) && miss.length > 0) {
@@ -294,9 +291,9 @@ app.post("/chat", async (req, res) => {
         return res.status(200).json({ reply: ask });
       }
     }
-    // after this point we never ask again this session
+    // After this, we never ask again in this session.
 
-    // Compose system prompt + history (Change #3: shorter lines)
+    // System prompt (short lines)
     const systemPrompt = `
 You are "Trucks Helper" — precise, friendly, human.
 Write short lines. Prefer bullets. Avoid long paragraphs.
@@ -314,42 +311,38 @@ No raw URLs; links are injected later.`;
     });
 
     let reply = r?.choices?.[0]?.message?.content
-      || "• Tell me what you’re working on and I’ll jump in.";
+      || (isGreetingOrSmallTalk(message) ? "• Hi! How can I help today?" : "• Tell me what you’re working on and I’ll jump in.");
 
-    // -------------- Change #1: link ANY brand/product/category --------------
-    const productType = null; // we don’t restrict by curated types anymore
-    let queries = extractProductQueries({ userMsg: message, modelReply: reply, vehicle, productType, max: 6 });
+    // === Only attach affiliate links when it's truly product intent ===
+    if (!isGreetingOrSmallTalk(message)) {
+      const queries = extractProductQueries({ userMsg: message, modelReply: reply, vehicle, max: 6 });
 
-    // Fallback if nothing detected but it looks like shopping
-    if (!queries.length && wantsProducts) {
-      const veh = vehicleString(vehicle);
-      const seed = veh ? `${veh} truck accessories` : "truck accessories";
-      queries = [seed];
-    }
+      if (queries.length) {
+        const tagged = queries.map(q => ({ name:q, url: buildAmazonSearchURL(q, { marketplace }) }));
+        reply = injectAffiliateLinks(reply, tagged);
 
-    if (queries.length) {
-      // Build URL map and link inside body
-      const tagged = queries.map(q => ({ name:q, url: buildAmazonSearchURL(q, { marketplace }) }));
-      reply = injectAffiliateLinks(reply, tagged);
-
-      // Add footer with explicit links
-      const lines = queries.map(q => tinySearchLine(q, marketplace));
-      reply = `${reply}
+        // Footer with explicit links
+        const lines = queries.map(q => tinySearchLine(q, marketplace));
+        reply = `${reply}
 
 You might consider:
 ${lines.join("\n")}
 As an Amazon Associate, we may earn from qualifying purchases.`;
+      }
     }
 
-    // -------------- Change #3: enforce small, skimmable bullets --------------
+    // Small, skimmable bullets + friendly follow-up
     const [core, ...tail] = reply.split("\n\nYou might consider:");
     let small = toBullets(core);
     if (tail.length) small += "\n\nYou might consider:" + tail.join("\n\nYou might consider:");
-
-    // -------------- Change #4: open-ended follow-up --------------
     small += `\n\n${followUpLine(message, vehicle)}`;
 
-    // Keep your “upsell after HOW-TO” flag behavior (still once)
+    // For pure greeting, keep it super clean (no footer, no salesy tone)
+    if (isGreetingOrSmallTalk(message)) {
+      small = "• Hi! How can I help today?\n\n• Parts, fitment, or a quick how-to?";
+    }
+
+    // Add “upsell after HOW-TO” once (kept from your original)
     if (isHowTo && !sess.flags.offeredUpsellAfterHowTo) {
       small += `\n• Want me to fetch parts lists or torque specs?`;
       sess.flags.offeredUpsellAfterHowTo = true;
@@ -423,7 +416,7 @@ a{color:var(--muted);text-decoration:underline}
     return {node:d, stop:()=>clearInterval(id)};
   }
 
-  add('AI',"• Hi! I’m your AI truck helper.\\n• Ask me anything — parts, fitment, or step-by-step how-to.");
+  add('AI',"• Hi! I’m your AI truck helper.\\n• Parts, fitment, or a quick how-to — ask away.");
 
   $f.addEventListener('submit', async e=>{
     e.preventDefault();
