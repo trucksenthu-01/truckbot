@@ -1,8 +1,8 @@
-// server.js — Chat + memory + crisp liners + human follow-ups + safe product links + GEO (US/UK/CA)
+// server.js — Chat + memory + crisp liners + human follow-ups + inline product links only + GEO (US/UK/CA)
 // - Strong CORS (Android/AMP-safe), OPTIONS preflight
 // - Remembers vehicle per session (year/make/model/etc.)
-// - Replies are converted to short, skimmable lines (no big paragraphs)
-// - Affiliate links ONLY for real products; categories shown only in the footer list
+// - Replies are short, skimmable lines (no big paragraphs)
+// - Affiliate links ONLY inline on real product names (no footer "View on Amazon" list)
 // - One-time fitment ask per session
 // - No affiliate disclaimer text in replies
 // - /widget endpoint (works in normal + AMP <amp-iframe>)
@@ -151,7 +151,7 @@ function detectCategories(text=""){
 // Tire brands so "Brand Model" counts as a product even with no digits.
 const TIRE_BRANDS = [
   "Goodyear","BFGoodrich","Michelin","Bridgestone","Nitto","Toyo","Pirelli",
-  "Continental","Cooper","Yokohama","Falken","General","Hankook","Kumho"
+  "Continental","Cooper","Yokohama","Falken","General","Hankook","Kumho","Nokian","Firestone","Dunlop"
 ];
 
 const NON_PRODUCT_PHRASES = [
@@ -188,7 +188,6 @@ function isProductishPhrase(phrase=""){
   const hasToken = PRODUCT_TOKENS.some(tok => lc.split(/\s+/).includes(tok)) ||
                    ["cold air intake","light bar","bed liner","floor mats","cat-back"].some(t => lc.includes(t));
   const hasAlphaNumMix = /\b(?:[a-z]*\d+[a-z]+|[a-z]+[0-9]+)\b/i.test(phrase) || /&/.test(phrase);
-  // New: treat "Brand Model ..." (e.g., Goodyear Wrangler Duratrac) as a product
   const brandModel = startsWithTireBrand(phrase) && phrase.trim().split(/\s+/).length >= 2;
   return hasToken || hasAlphaNumMix || brandModel;
 }
@@ -210,7 +209,7 @@ function isShoppingIntent(text=""){
   return /\b(cover|intake|kit|pads?|rotors?|brake|shocks?|struts?|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter|suspension)\b/i.test(text);
 }
 
-/* ---------------- Safe link injection ---------------- */
+/* ---------------- Safe link injection (inline products only) ---------------- */
 function stripMarkdownBasic(s=""){return s
   .replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1")
   .replace(/^#+\s*(.+)$/gm,"$1").replace(/!\[[^\]]*\]\([^)]+\)/g,"")
@@ -227,7 +226,7 @@ function protectAnchors(text){
 }
 function restoreAnchors(text, anchors){ return text.replace(/__A(\d+)__/g, (_,i)=>anchors[+i]); }
 
-// IMPORTANT: we now accept "items" with { name, url, kind } and we SKIP linking for kind === "cat".
+// IMPORTANT: we accept "items" with { name, url, kind } and SKIP linking for kind === "cat".
 function injectAffiliateLinks(replyText="", items=[]) {
   if(!replyText || !items?.length) return replyText;
   let out = stripMarkdownBasic(replyText);
@@ -280,10 +279,6 @@ function buildQueryItems({ userMsg, modelReply, vehicle, max=8 }){
     if (items.length >= max) return items;
   }
   return items;
-}
-function tinySearchLineItem(item, marketplace){
-  const url = buildAmazonSearchURL(item.query, { marketplace });
-  return `• ${escapeHtml(item.display)} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
 /* ---------------- Liners: force short, readable lines ---------------- */
@@ -443,7 +438,7 @@ No raw URLs; links are injected later.`;
     let reply = r?.choices?.[0]?.message?.content
       || (isGreetingOrSmallTalk(message) ? "• Hi! How can I help today?" : "• Tell me what you’re working on and I’ll jump in.");
 
-    // Build link targets (products + categories), but only inline-link products
+    // Build link targets (products + categories), but only inline-link products; NO footer list.
     let items = [];
     if (!isGreetingOrSmallTalk(message)) {
       items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 8 });
@@ -454,21 +449,13 @@ No raw URLs; links are injected later.`;
           url: buildAmazonSearchURL(it.query, { marketplace }),
           kind: it.kind
         }));
-        // Inline links for products only
+        // Inline links for products only (kind !== "cat")
         reply = injectAffiliateLinks(reply, linkTargets);
-
-        // Footer list (products & categories OK here)
-        if (!/\nYou might consider:/i.test(reply)) {
-          const lines = items.map(it => tinySearchLineItem(it, marketplace));
-          reply = `${reply}\n\nYou might consider:\n${lines.join("\n")}`;
-        }
       }
     }
 
-    // Liners + targeted follow-up
-    const [core, ...tail] = reply.split("\n\nYou might consider:");
-    let small = toLiners(core);
-    if (tail.length) small += "\n\nYou might consider:" + toLiners(tail.join("\n\nYou might consider:"));
+    // Liners + targeted follow-up (no "You might consider" block anymore)
+    let small = toLiners(reply);
     small += `\n\n${toLiners(targetedFollowUp(message, vehicle, items))}`;
 
     // Pure greeting: super clean
@@ -507,7 +494,7 @@ header .logo{width:28px;height:28px;border-radius:50%;display:grid;place-items:c
 #msgs{flex:1;overflow:auto;padding:12px}
 .msg{margin:8px 0}.who{font-size:11px;opacity:.7;margin-bottom:4px}
 .bubble{background:#141a22;border:1px solid var(--border);border-radius:12px;padding:10px 12px;white-space:pre-wrap}
-.me . bubble{background:rgba(31,111,235,.1);border-color:#2a3b52}
+.me .bubble{background:rgba(31,111,235,.1);border-color:#2a3b52}
 form{display:flex;gap:8px;padding:10px;background:var(--panel);border-top:1px solid var(--border)}
 input{flex:1;border:1px solid #2a3b52;border-radius:10px;background:var(--bg);color:var(--text);padding:10px}
 button{border:0;border-radius:10px;background:var(--accent);color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}
