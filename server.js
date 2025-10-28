@@ -1,16 +1,16 @@
-// server.js — ChatGPT-like bullets (no TL;DR), memory, safe product links, GEO (US/UK/CA)
+// server.js — Chat bullets (no TL;DR) + memory + brand/product inline links + GEO + analytics hook
 // - Strong CORS (Android/AMP-safe), OPTIONS preflight
-// - Remembers vehicle per session; asks fitment once
-// - Inline affiliate links only on brands/products (not generic words)
+// - Remembers vehicle per session; asks fitment at most once
+// - Inline affiliate links ONLY on brand/product phrases (not generic words)
 // - No “View on Amazon” block
-// - /widget endpoint (normal + AMP)
+// - /widget endpoint (optional demo) and /analytics endpoint for simple tracking
 
 import "dotenv/config";
 import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
 
-// Optional: your own extractor
+// Optional: your extractor (kept as-is if present)
 import { extractIntent } from "./recommend.js";
 
 const app = express();
@@ -127,17 +127,36 @@ function escapeHtml(s = "") {
 }
 
 /* ---------------- Product/brand detection ---------------- */
+/* Expanded brand list (tuners, intakes, exhausts, suspension, wheels/tires, mats, lighting, racks, winches, covers, brakes, steps, batteries) */
 const BRANDS = [
-  // tuners
+  // Tuners
   "SCT","DiabloSport","Bully Dog","Edge","Hypertech","Superchips",
-  // tonneau
-  "BAKFlip","Retrax","RetraxPRO","UnderCover","GatorTrax","TruXedo","Extang","Roll-N-Lock","Pace Edwards","Leer",
-  // lifts/shocks/suspension
-  "Bilstein","FOX","Eibach","ICON","BDS","Rough Country","ReadyLIFT","Rancho",
-  // brakes
-  "Power Stop","Brembo","EBC","Hawk",
-  // steps/boards
-  "AMP Research","Westin","N-FAB","Tyger Auto","Ionic","Go Rhino"
+  // Intakes/Filters
+  "K&N","S&B","aFe Power","AEM","Spectre",
+  // Exhaust
+  "Borla","MagnaFlow","Flowmaster","Corsa","MBRP","Gibson",
+  // Suspension/Shocks/Lifts
+  "Bilstein","FOX","Fox","King","Eibach","ICON","ICON Vehicle Dynamics","Rancho","KYB","Monroe","Old Man Emu","OME",
+  "Rough Country","ReadyLIFT","BDS","Fabtech","Skyjacker","Pro Comp","Superlift","Zone Offroad",
+  // Wheels/Tires
+  "Method","Fuel","Fuel Off-Road","KMC","Black Rhino","American Racing","Moto Metal",
+  "BFGoodrich","Nitto","Toyo","Goodyear","Michelin","Falken","Cooper","General Tire","Yokohama",
+  // Brakes
+  "Power Stop","Brembo","EBC","Hawk","Wilwood","StopTech",
+  // Steps/Boards
+  "AMP Research","Westin","N-FAB","Tyger Auto","Ionic","Go Rhino","Lund","Dee Zee","Aries",
+  // Tonneau / Covers
+  "BAKFlip","BAK","Retrax","RetraxPRO","UnderCover","GatorTrax","TruXedo","Extang","Roll-N-Lock","Pace Edwards","Leer","DiamondBack",
+  // Racks/Overland
+  "Yakima","Thule","Rhino-Rack","Front Runner","Prinsu",
+  // Lighting
+  "Rigid Industries","Baja Designs","KC HiLiTES","Morimoto","Auxbeam","Nilight","Diode Dynamics",
+  // Mats/Liners & Accessories
+  "WeatherTech","Husky Liners","SMARTLINER","Rough Country",
+  // Winches/Recovery
+  "WARN","Smittybilt","X-BULL",
+  // Batteries
+  "Optima","Odyssey"
 ];
 
 const CATEGORY_TERMS = [
@@ -149,7 +168,7 @@ const CATEGORY_TERMS = [
   "floor mats","bed liner","rack","exhaust","muffler","cat-back","header",
   "tuner","programmer","scanner",
   "headlights","taillights","light bar","fog lights",
-  "wheels","tires","all terrain","mud terrain"
+  "wheels","tires","all terrain","mud terrain","winch","battery"
 ];
 const CATEGORY_RE = new RegExp("\\b(" + CATEGORY_TERMS.map(s=>s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("|") + ")\\b","gi");
 function detectCategories(text=""){
@@ -213,7 +232,7 @@ function isShoppingIntent(text=""){
   if (!text) return false;
   if (detectCategories(text).length) return true;
   if (harvestProductPhrases(text).length) return true;
-  return /\b(cover|intake|kit|pads?|rotors?|brake|shocks?|struts?|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter)\b/i.test(text);
+  return /\b(cover|intake|kit|pads?|rotors?|brake|shocks?|struts?|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter|battery)\b/i.test(text);
 }
 
 /* ---------------- Safe link injection ---------------- */
@@ -268,19 +287,20 @@ function buildQueryItems({ userMsg, modelReply, vehicle, max=8 }){
   const cats = [...new Set([...catsUser, ...catsReply])];
   const primaryCat = cats[0] || "";
 
+  // Brands first
   for (const b of new Set([...detectBrands(userMsg||""), ...detectBrands(modelReply||"")])) {
     const key = `brand:${b.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
     const q = buildVehicleAwareQuery(vehicle, (primaryCat ? `${b} ${primaryCat}` : b));
     items.push({ display: b, query: q, kind: "brand" });
     if (items.length >= max) return items;
   }
-
+  // Product phrases next
   for (const p of new Set([...harvestProductPhrases(userMsg||""), ...harvestProductPhrases(modelReply||"")])) {
     const key = `prod:${p.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
     items.push({ display: p, query: buildVehicleAwareQuery(vehicle, p), kind: "prod" });
     if (items.length >= max) return items;
   }
-
+  // Categories last (for follow-ups, not linked)
   for (const c of cats) {
     const key = `cat:${c}`; if (seen.has(key)) continue; seen.add(key);
     items.push({ display: c, query: buildVehicleAwareQuery(vehicle, c), kind: "cat" });
@@ -291,7 +311,7 @@ function buildQueryItems({ userMsg, modelReply, vehicle, max=8 }){
 
 /* ---------------- Formatting: NO TL;DR, clean bullets ---------------- */
 function stripModelHeaders(s=""){
-  // Remove any headers the model might add (TL;DR / Steps / Safety / Details)
+  // Remove any headers the model might add (TL;DR / Steps / Safety / Details / You might consider)
   return (s||"")
     .replace(/^\s*(🧾\s*)?TL;?\s*DR.*$/gmi, "")
     .replace(/^\s*(🔧\s*)?Steps?:?.*$/gmi, "")
@@ -301,33 +321,28 @@ function stripModelHeaders(s=""){
     .trim();
 }
 function bulletize(text=""){
-  // 1) kill any headings  2) split sensibly  3) ensure single bullet  4) strip duplicate numbering
   const raw = stripModelHeaders(text);
   const pieces = raw.split(/\n+/).flatMap(line => {
     const t=line.trim();
     if (!t) return [];
-    if (/[•\-\*]\s+/.test(t) || /^\d+\.\s+/.test(t)) return [t]; // already list-like
-    // split dense paragraph into sentences
+    if (/[•\-\*]\s+/.test(t) || /^\d+\.\s+/.test(t)) return [t];
     return t.split(/(?<=\.|\?|!)\s+(?=[A-Z0-9])/);
   });
   const cleaned = pieces
-    .map(l => l
-      .replace(/^[•\-\*]\s+/, "") // remove any leading bullet
-      .replace(/^\d+\.\s+/, "")   // remove leading numbering
-      .trim())
+    .map(l => l.replace(/^[•\-\*]\s+/, "").replace(/^\d+\.\s+/, "").trim())
     .filter(Boolean);
   return cleaned.map(l => `• ${l}`).join("\n");
 }
-// ---- category helper + follow-up prompts (paste above app.post("/chat", ...)) ----
+
+/* ---------------- Category helper + targeted follow-ups ---------------- */
 function primaryCategoryFrom(items, userMsg){
   if (items && items.length) {
-    const i = items.find(it => it.kind === "cat");
+    const i = items.find(it=>it.kind==="cat");
     if (i) return i.display.toLowerCase();
   }
-  const cats = detectCategories(userMsg || "");
+  const cats = detectCategories(userMsg||"");
   return cats.length ? cats[0] : null;
 }
-
 function targetedFollowUp(userMsg, vehicle, items){
   const cat = primaryCategoryFrom(items, userMsg);
   if (!cat) {
@@ -338,7 +353,6 @@ function targetedFollowUp(userMsg, vehicle, items){
     }
     return "• Any budget or brand you prefer?";
   }
-
   if (cat.includes("tuner") || cat.includes("programmer")) {
     return "• Which engine (e.g., 2.7L/3.5L EcoBoost, 5.0)? • More power or MPG? • Budget range?";
   }
@@ -366,6 +380,23 @@ function targetedFollowUp(userMsg, vehicle, items){
 /* ---------------- Diagnostics ---------------- */
 app.get("/health", (_req,res)=>res.send("ok"));
 app.post("/echo", (req,res)=>res.json({ ok:true, origin:req.headers.origin||null, ua:req.headers["user-agent"]||null }));
+
+/* ---------------- Simple analytics endpoint ---------------- */
+app.post("/analytics", (req, res) => {
+  try {
+    const e = req.body || {};
+    console.log("[analytics]", {
+      name: e.name,
+      sess: e.sess,
+      ts: e.ts,
+      url: e.url,
+      params: e.params
+    });
+  } catch (err) {
+    console.warn("[analytics] parse error", err?.message);
+  }
+  res.json({ ok: true });
+});
 
 /* ---------------- Chat ---------------- */
 app.post("/chat", async (req, res) => {
@@ -435,7 +466,7 @@ Avoid generic upsells; keep answers specific and helpful.`;
     // Final formatting: bullets only, NO TL;DR
     let styled = bulletize(reply);
 
-    // Targeted follow-up (kept concise)
+    // Targeted follow-up
     styled += `\n\n${targetedFollowUp(message, vehicle, items)}`;
 
     // Pure greeting
@@ -460,7 +491,7 @@ Avoid generic upsells; keep answers specific and helpful.`;
   }
 });
 
-/* ---------------- Lightweight embeddable widget page ---------------- */
+/* ---------------- Lightweight embeddable widget page (demo) ---------------- */
 app.get("/widget", (_req, res) => {
   res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
