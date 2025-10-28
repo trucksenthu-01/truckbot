@@ -2,10 +2,9 @@
 // - Strong CORS (Android/AMP-safe), OPTIONS preflight
 // - Remembers vehicle per session (year/make/model/etc.)
 // - Replies are converted to short, skimmable lines (no big paragraphs)
-// - Follow-ups are category-aware and conversational (not generic)
-// - Affiliate links ONLY for product intent (never generic phrases)
-// - Fitment asked at most once per session
-// - No affiliate disclaimer in messages (you already show it in UI)
+// - Affiliate links ONLY for real products; categories shown only in the footer list
+// - One-time fitment ask per session
+// - No affiliate disclaimer text in replies
 // - /widget endpoint (works in normal + AMP <amp-iframe>)
 
 import "dotenv/config";
@@ -13,7 +12,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
 
-// Optional: keep your extractor if present
+// keep if you have it
 import { extractIntent } from "./recommend.js";
 
 const app = express();
@@ -149,6 +148,12 @@ function detectCategories(text=""){
   return [...set];
 }
 
+// Tire brands so "Brand Model" counts as a product even with no digits.
+const TIRE_BRANDS = [
+  "Goodyear","BFGoodrich","Michelin","Bridgestone","Nitto","Toyo","Pirelli",
+  "Continental","Cooper","Yokohama","Falken","General","Hankook","Kumho"
+];
+
 const NON_PRODUCT_PHRASES = [
   "determine compatibility","choose type","research brands","read reviews",
   "compare prices","check features","warranty & support","warranty and support",
@@ -172,6 +177,10 @@ function looksLikeVehicleOnly(phrase=""){
   if (/(f[\s-]?150|silverado|sierra|tacoma|tundra|ranger|ram\s?1500|gladiator|maverick|colorado|frontier)/i.test(phrase) && MAKES.some(m=>lc.includes(m))) return true;
   return false;
 }
+function startsWithTireBrand(phrase=""){
+  const first = (phrase.split(/\s+/)[0] || "").replace(/[^\w]/g,"");
+  return TIRE_BRANDS.includes(first);
+}
 function isProductishPhrase(phrase=""){
   const lc = phrase.toLowerCase();
   if (NON_PRODUCT_PHRASES.some(p => lc.includes(p))) return false;
@@ -179,7 +188,9 @@ function isProductishPhrase(phrase=""){
   const hasToken = PRODUCT_TOKENS.some(tok => lc.split(/\s+/).includes(tok)) ||
                    ["cold air intake","light bar","bed liner","floor mats","cat-back"].some(t => lc.includes(t));
   const hasAlphaNumMix = /\b(?:[a-z]*\d+[a-z]+|[a-z]+[0-9]+)\b/i.test(phrase) || /&/.test(phrase);
-  return hasToken || hasAlphaNumMix;
+  // New: treat "Brand Model ..." (e.g., Goodyear Wrangler Duratrac) as a product
+  const brandModel = startsWithTireBrand(phrase) && phrase.trim().split(/\s+/).length >= 2;
+  return hasToken || hasAlphaNumMix || brandModel;
 }
 function harvestProductPhrases(text=""){
   if (!text) return [];
@@ -215,11 +226,14 @@ function protectAnchors(text){
   return { out, anchors };
 }
 function restoreAnchors(text, anchors){ return text.replace(/__A(\d+)__/g, (_,i)=>anchors[+i]); }
-function injectAffiliateLinks(replyText="", products=[]) {
-  if(!replyText || !products?.length) return replyText;
+
+// IMPORTANT: we now accept "items" with { name, url, kind } and we SKIP linking for kind === "cat".
+function injectAffiliateLinks(replyText="", items=[]) {
+  if(!replyText || !items?.length) return replyText;
   let out = stripMarkdownBasic(replyText);
-  for (const p of products){
-    const url=p?.url, full=p?.name; if(!url||!full) continue;
+  for (const it of items){
+    if (!it || it.kind === "cat") continue; // only products get inline links
+    const url=it.url, full=it.name; if(!url||!full) continue;
     let { out: noA, anchors } = protectAnchors(out);
     const tokenRe=buildOrderedTokenRegex(full);
     if(tokenRe && tokenRe.test(noA)){
@@ -236,13 +250,13 @@ function injectAffiliateLinks(replyText="", products=[]) {
   return out;
 }
 
-/* ---------------- Query extraction (products only) ---------------- */
+/* ---------------- Query extraction (products + categories) ---------------- */
 function vehicleString(v){ return [v?.year,v?.make,v?.model].filter(Boolean).join(" "); }
 function buildVehicleAwareQuery(vehicle, q) {
   const veh = vehicleString(vehicle);
   return [veh, q].filter(Boolean).join(" ").trim();
 }
-function buildQueryItems({ userMsg, modelReply, vehicle, max=6 }){
+function buildQueryItems({ userMsg, modelReply, vehicle, max=8 }){
   const items = [];
   const seen = new Set();
   for (const c of detectCategories(userMsg||"")) {
@@ -273,35 +287,27 @@ function tinySearchLineItem(item, marketplace){
 }
 
 /* ---------------- Liners: force short, readable lines ---------------- */
-// Turns paragraphs, numbered lists, and dash lists into crisp bullets.
-// Splits on punctuation, list markers, and " - " explanations.
 function toLiners(text=""){
   if (!text) return text;
-  // Normalize newlines, split aggressively
   const raw = text
     .replace(/\r/g,"")
-    .replace(/[•\u2022]/g,"• ")                 // keep existing bullets
-    .replace(/\n{2,}/g,"\n")                    // compress blank lines
-    .replace(/(\d+)\.\s+/g, "$1) ")             // 1. -> 1)
-    .replace(/\s*-\s+/g, " — ");                // dash explanations
-
+    .replace(/[•\u2022]/g,"• ")
+    .replace(/\n{2,}/g,"\n")
+    .replace(/(\d+)\.\s+/g, "$1) ")
+    .replace(/\s*-\s+/g, " — ");
   const chunks = raw.split(/\n/).flatMap(line => {
-    // Split sentences and semi-colon-ish boundaries
     return line
       .split(/(?<=[.!?])\s+(?=[A-Z0-9])|(?<=\))\s+|(?<=—)\s+/)
       .map(s => s.trim()).filter(Boolean);
   });
-
   const bullets = [];
   for (let s of chunks) {
-    // Split further on " — " to avoid long lines
     const parts = s.split(/\s—\s/).map(p=>p.trim()).filter(Boolean);
     for (const p of parts) {
       const line = p.startsWith("•") ? p : `• ${p}`;
       bullets.push(line);
     }
   }
-  // Deduplicate adjacent identical bullets
   return bullets.filter((l,i,a)=> i===0 || l !== a[i-1]).join("\n");
 }
 
@@ -315,7 +321,6 @@ function targetedFollowUp(userMsg, vehicle, items){
   const cat = primaryCategoryFrom(items, userMsg);
   const veh = vehicleString(vehicle);
 
-  // If no clear category, fall back to gentle, helpful nudge
   if (!cat) {
     if (looksLikeHowTo(userMsg)) {
       return veh
@@ -325,42 +330,41 @@ function targetedFollowUp(userMsg, vehicle, items){
     return "• If you tell me your budget or a brand you like, I’ll narrow it for you.";
   }
 
-  // Category-specific, conversational follow-ups
   if (cat.includes("suspension") || cat.includes("lift") || cat.includes("level")) {
     return [
-      "• What **lift or level height** are you aiming for (e.g., 1–2\", 3–4\")?",
-      "• Is your truck **2WD or 4WD**, and do you want to **retain factory ride** or firm it up?",
-      "• What **wheel/tire size and offset** are you planning? That decides clearance and UCA needs.",
+      "• What **lift/level height** are you aiming for (e.g., 1–2\", 3–4\")?",
+      "• **2WD or 4WD**, and keep factory ride or firmer?",
+      "• Planned **wheel/tire size + offset** (helps with clearance)?",
       "• Any budget range I should stay within?"
     ].join("\n");
   }
   if (cat.includes("tuner") || cat.includes("programmer")) {
     return [
-      "• Which **engine** (2.7L/3.5L EcoBoost, 5.0 Coyote)?",
-      "• Are you chasing **power**, **MPG**, or a **tow tune**?",
-      "• Do you want **preloaded tunes** only or room for **custom dyno tunes**?",
+      "• Which **engine** (2.7/3.5 EcoBoost, 5.0)?",
+      "• Goal: **power**, **MPG**, or **tow**?",
+      "• Preloaded tunes only or **custom dyno** later?",
       "• Ballpark budget?"
     ].join("\n");
   }
   if (cat.includes("intake")) {
     return [
-      "• Do you prefer an **open** intake (more sound) or a **sealed box** (quieter, better IATs)?",
-      "• Any plan to add a **tune** soon?",
-      "• Want **washable** filter or **oiled**?"
+      "• **Open** (more sound) or **sealed box** (quieter/better IATs)?",
+      "• Planning a **tune** soon?",
+      "• **Dry** vs **oiled** filter?"
     ].join("\n");
   }
   if (cat.includes("brake")) {
     return [
-      "• Daily commute, **towing**, or spirited use?",
-      "• Priority on **low dust/quiet** or **max bite**?",
-      "• Okay with **slotted/drilled rotors**, or prefer plain?"
+      "• Daily, **towing**, or spirited?",
+      "• **Low dust/quiet** or **max bite**?",
+      "• Okay with **slotted/drilled** or prefer plain?"
     ].join("\n");
   }
   if (cat.includes("running") || cat.includes("nerf") || cat.includes("step")) {
     return [
-      "• **Power-deploying** or **fixed** steps?",
-      "• Need **drop steps** for easier entry?",
-      "• Finish: **black coated** or **stainless**?"
+      "• **Power-deploying** or **fixed**?",
+      "• Need **drop steps**?",
+      "• Finish: **black** or **stainless**?"
     ].join("\n");
   }
   if (cat.includes("tonneau") || cat.includes("bed cover")) {
@@ -370,10 +374,10 @@ function targetedFollowUp(userMsg, vehicle, items){
       "• Priority: **security**, **weather seal**, or **price**?"
     ].join("\n");
   }
-  if (cat.includes("tire")) {
+  if (cat.includes("tire") || cat.includes("wheels")) {
     return [
-      "• **Highway**, **A/T**, or **M/T** use mostly?",
-      "• Desired **size** and **wheel offset** (for rubbing check)?",
+      "• Use case: **Highway**, **A/T**, or **M/T**?",
+      "• Desired **size** and **wheel offset** (I’ll check rubbing)?",
       "• Preference: **low noise** or **maximum grip**?"
     ].join("\n");
   }
@@ -439,18 +443,21 @@ No raw URLs; links are injected later.`;
     let reply = r?.choices?.[0]?.message?.content
       || (isGreetingOrSmallTalk(message) ? "• Hi! How can I help today?" : "• Tell me what you’re working on and I’ll jump in.");
 
-    // Product links (only for real product/category intent)
+    // Build link targets (products + categories), but only inline-link products
     let items = [];
     if (!isGreetingOrSmallTalk(message)) {
-      items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 6 });
+      items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 8 });
+
       if (items.length) {
         const linkTargets = items.map(it => ({
           name: it.display,
-          url: buildAmazonSearchURL(it.query, { marketplace })
+          url: buildAmazonSearchURL(it.query, { marketplace }),
+          kind: it.kind
         }));
+        // Inline links for products only
         reply = injectAffiliateLinks(reply, linkTargets);
 
-        // Compact helper block (once)
+        // Footer list (products & categories OK here)
         if (!/\nYou might consider:/i.test(reply)) {
           const lines = items.map(it => tinySearchLineItem(it, marketplace));
           reply = `${reply}\n\nYou might consider:\n${lines.join("\n")}`;
@@ -458,13 +465,13 @@ No raw URLs; links are injected later.`;
       }
     }
 
-    // Convert to clean liners + attach targeted follow-up
+    // Liners + targeted follow-up
     const [core, ...tail] = reply.split("\n\nYou might consider:");
     let small = toLiners(core);
     if (tail.length) small += "\n\nYou might consider:" + toLiners(tail.join("\n\nYou might consider:"));
     small += `\n\n${toLiners(targetedFollowUp(message, vehicle, items))}`;
 
-    // Pure greeting: keep it super clean
+    // Pure greeting: super clean
     if (isGreetingOrSmallTalk(message)) {
       small = "• Hi! How can I help today?\n• Parts, fitment, or a quick how-to — ask away.";
     }
@@ -500,7 +507,7 @@ header .logo{width:28px;height:28px;border-radius:50%;display:grid;place-items:c
 #msgs{flex:1;overflow:auto;padding:12px}
 .msg{margin:8px 0}.who{font-size:11px;opacity:.7;margin-bottom:4px}
 .bubble{background:#141a22;border:1px solid var(--border);border-radius:12px;padding:10px 12px;white-space:pre-wrap}
-.me .bubble{background:rgba(31,111,235,.1);border-color:#2a3b52}
+.me . bubble{background:rgba(31,111,235,.1);border-color:#2a3b52}
 form{display:flex;gap:8px;padding:10px;background:var(--panel);border-top:1px solid var(--border)}
 input{flex:1;border:1px solid #2a3b52;border-radius:10px;background:var(--bg);color:var(--text);padding:10px}
 button{border:0;border-radius:10px;background:var(--accent);color:#fff;padding:10px 14px;font-weight:700;cursor:pointer}
