@@ -1,8 +1,9 @@
 // server.js — ChatGPT-style answers + memory + targeted follow-ups + safe product links + GEO (US/UK/CA)
 // - Strong CORS (Android/AMP-safe), OPTIONS preflight
 // - Remembers vehicle per session (year/make/model/etc.); asks fitment at most once
-// - ChatGPT-like sectioned replies (TL;DR / Steps / Safety / Next)
-// - Affiliate links ONLY for product intent (not greetings / general advice)
+// - Sectioned replies without duplicate headers
+// - Inline affiliate links ONLY on real product/brand phrases (not generic words)
+// - No bottom "View on Amazon" block
 // - /widget endpoint (works in normal + AMP <amp-iframe>)
 
 import "dotenv/config";
@@ -10,7 +11,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
 
-// Optional: your own extractor (leave as-is if present)
+// Optional: your own extractor
 import { extractIntent } from "./recommend.js";
 
 const app = express();
@@ -126,7 +127,21 @@ function escapeHtml(s = "") {
   });
 }
 
-/* ---------------- Product intent (brand-agnostic) ---------------- */
+/* ---------------- Product/brand detection ---------------- */
+// Expanded brand set (tuner, tonneau, lift, brakes, steps, shocks)
+const BRANDS = [
+  // tuners
+  "SCT","DiabloSport","Bully Dog","Edge","Hypertech","Superchips",
+  // tonneau
+  "BAKFlip","Retrax","RetraxPRO","UnderCover","GatorTrax","TruXedo","Extang","Roll-N-Lock","Pace Edwards","Leer",
+  // lifts/shocks/suspension
+  "Bilstein","FOX","Eibach","ICON","BDS","Rough Country","ReadyLIFT","Rancho",
+  // brakes
+  "Power Stop","Brembo","EBC","Hawk",
+  // steps/boards
+  "AMP Research","Westin","N-FAB","Tyger Auto","Ionic","Go Rhino"
+];
+
 const CATEGORY_TERMS = [
   "cold air intake","air intake","intake","intake kit","intake filter","air filter",
   "tonneau cover","bed cover","retractable tonneau","tri-fold tonneau","hard folding cover","soft roll-up cover",
@@ -159,8 +174,10 @@ const PRODUCT_TOKENS = [
   "bar","light","lights","led","winch","hitch","battery"
 ];
 
+// allow single-word proper-noun phrases too
+const PROD_PHRASE_RE = /\b([A-Z][A-Za-z0-9&\-]+(?:\s+[A-Z0-9][A-Za-z0-9&\-]+){0,6})\b/g;
+
 const MAKES = ["ford","chevrolet","chevy","gmc","ram","dodge","toyota","nissan","jeep","honda","subaru"];
-const PROD_PHRASE_RE = /\b([A-Z][A-Za-z0-9&\-]+(?:\s+[A-Z0-9][A-Za-z0-9&\-]+){1,6})\b/g;
 
 function looksLikeVehicleOnly(phrase=""){
   const lc = phrase.toLowerCase();
@@ -183,10 +200,18 @@ function harvestProductPhrases(text=""){
   while ((m = PROD_PHRASE_RE.exec(text)) !== null) {
     const raw = m[1].trim().replace(/\s{2,}/g," ").replace(/[.,;:)\]]+$/,"");
     if (!/[A-Za-z]/.test(raw)) continue;
-    if (!isProductishPhrase(raw)) continue;
+    if (!isProductishPhrase(raw) && !BRANDS.includes(raw)) continue;
     hits.add(raw);
   }
   return [...hits];
+}
+function detectBrands(text=""){
+  const found = new Set();
+  for (const b of BRANDS) {
+    const re = new RegExp(`\\b${b.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}\\b`,"i");
+    if (re.test(text)) found.add(b);
+  }
+  return [...found];
 }
 function isShoppingIntent(text=""){
   if (!text) return false;
@@ -199,7 +224,7 @@ function isShoppingIntent(text=""){
 function stripMarkdownBasic(s=""){return s
   .replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1")
   .replace(/^#+\s*(.+)$/gm,"$1").replace(/!\[[^\]]*\]\([^)]+\)/g,"")
-  .replace(/\[[^\]]+\]\([^)]+\)/g,"$&");} // keep inline links; we later protect/restore anchors
+  .replace(/\[[^\]]+\]\([^)]+\)/g,"$&");} // keep any markdown anchors intact
 const _STOP = new Set(["the","a","an","for","to","of","on","with","and","or","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great","kit","pads","brakes"]);
 const _norm = s => (s||"").toLowerCase().replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim();
 const _toks = s => _norm(s).split(" ").filter(t=>t&&!_STOP.has(t));
@@ -232,76 +257,75 @@ function injectAffiliateLinks(replyText="", products=[]) {
   return out;
 }
 
-/* ---------------- Query extraction (products only) ---------------- */
+/* ---------------- Query extraction ---------------- */
 function vehicleString(v){ return [v?.year,v?.make,v?.model].filter(Boolean).join(" "); }
 function buildVehicleAwareQuery(vehicle, q) {
   const veh = vehicleString(vehicle);
   return [veh, q].filter(Boolean).join(" ").trim();
 }
-function buildQueryItems({ userMsg, modelReply, vehicle, max=6 }){
+function buildQueryItems({ userMsg, modelReply, vehicle, max=8 }){
   const items = [];
   const seen = new Set();
-  for (const c of detectCategories(userMsg||"")) {
-    const key = `cat:${c}`; if (seen.has(key)) continue; seen.add(key);
-    items.push({ display: c, query: buildVehicleAwareQuery(vehicle, c), kind: "cat" });
+
+  const catsUser  = detectCategories(userMsg||"");
+  const catsReply = detectCategories(modelReply||"");
+  const cats = [...new Set([...catsUser, ...catsReply])];
+  const primaryCat = cats[0] || "";
+
+  // Brand hits (prefer these for linking)
+  for (const b of new Set([...detectBrands(userMsg||""), ...detectBrands(modelReply||"")])) {
+    const key = `brand:${b.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
+    const q = buildVehicleAwareQuery(vehicle, (primaryCat ? `${b} ${primaryCat}` : b));
+    items.push({ display: b, query: q, kind: "brand" });
     if (items.length >= max) return items;
   }
-  for (const c of detectCategories(modelReply||"")) {
-    const key = `cat:${c}`; if (seen.has(key)) continue; seen.add(key);
-    items.push({ display: c, query: buildVehicleAwareQuery(vehicle, c), kind: "cat" });
-    if (items.length >= max) return items;
-  }
-  for (const p of harvestProductPhrases(userMsg||"")) {
-    const key = `p:${p.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
+
+  // Specific product phrases (e.g., "Power Stop Z36 kit")
+  for (const p of new Set([...harvestProductPhrases(userMsg||""), ...harvestProductPhrases(modelReply||"")])) {
+    const key = `prod:${p.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
     items.push({ display: p, query: buildVehicleAwareQuery(vehicle, p), kind: "prod" });
     if (items.length >= max) return items;
   }
-  for (const p of harvestProductPhrases(modelReply||"")) {
-    const key = `p:${p.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
-    items.push({ display: p, query: buildVehicleAwareQuery(vehicle, p), kind: "prod" });
+
+  // Categories last (used for follow-ups, not for inline linking)
+  for (const c of cats) {
+    const key = `cat:${c}`; if (seen.has(key)) continue; seen.add(key);
+    items.push({ display: c, query: buildVehicleAwareQuery(vehicle, c), kind: "cat" });
     if (items.length >= max) return items;
   }
   return items;
 }
-function tinySearchLineItem(item, marketplace){
-  const url = buildAmazonSearchURL(item.query, { marketplace });
-  return `• ${escapeHtml(item.display)} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
-}
 
-/* ---------------- ChatGPT-like formatting helpers ---------------- */
+/* ---------------- ChatGPT-like formatting ---------------- */
 function toBullets(text=""){
   const parts = text.replace(/\s+/g," ").split(/(?<=[\.!?])\s+(?=[A-Z0-9])/).map(s=>s.trim()).filter(Boolean);
   if (!parts.length) return text.startsWith("•") ? text : `• ${text}`;
   return parts.map(l => l.startsWith("•") ? l : `• ${l}`).join("\n");
 }
+function cleanHeaders(s=""){
+  // If model sneaks in headers, strip them to avoid TL;DR duplication
+  return s.replace(/^(\s*🧾\s*TL;DR.*|\s*TL;DR.*)$/gmi,"").trim();
+}
 function chatgptSections(core, { howto=false } = {}) {
-  // Create compact, skimmable sections like ChatGPT responses.
-  let out = "";
-  const lines = core.split(/\n+/).map(s=>s.trim()).filter(Boolean);
-
-  // Build TL;DR from the first 1–2 lines
+  const cleaned = cleanHeaders(core);
+  const lines = cleaned.split(/\n+/).map(s=>s.trim()).filter(Boolean);
   const tldr = lines.slice(0,2).join(" ");
-  out += `🧾 TL;DR\n${toBullets(tldr)}\n\n`;
-
-  // Steps section if it's a how-to or looks procedural
+  let out = `🧾 TL;DR\n${toBullets(tldr)}\n\n`;
   if (howto) {
-    const stepLines = lines.filter(l => /step|install|replace|check|do|start|stop|tighten|measure/i.test(l));
-    if (stepLines.length) {
-      out += `🔧 Steps\n${stepLines.map(l=>l.startsWith("•")?l:`• ${l}`).join("\n")}\n\n`;
-    }
-    // Safety heuristics
+    const stepLines = lines.filter(l => /step|install|replace|check|start|remove|tighten|measure|torque/i.test(l));
+    if (stepLines.length) out += `🔧 Steps\n${stepLines.map(l=>l.startsWith("•")?l:`• ${l}`).join("\n")}\n\n`;
     const safety = lines.filter(l => /safety|wear|gloves|eye|torque|support|jack|disconnect|cool|hot|warning|caution/i.test(l));
     if (safety.length) out += `⚠️ Safety\n${safety.map(l=>l.startsWith("•")?l:`• ${l}`).join("\n")}\n\n`;
   }
-
-  // General guidance bundle
-  const rest = lines.slice(2).filter(l=>l && !/^•?\s*(You might consider:)/i.test(l));
+  const rest = lines.slice(2).filter(Boolean);
   if (rest.length) out += `🧠 Details\n${rest.map(l=>l.startsWith("•")?l:`• ${l}`).join("\n")}`;
-
   return out.trim();
 }
 function primaryCategoryFrom(items, userMsg){
-  if (items && items.length) return items[0].display.toLowerCase();
+  if (items && items.length) {
+    const i = items.find(it=>it.kind==="cat");
+    if (i) return i.display.toLowerCase();
+  }
   const cats = detectCategories(userMsg||"");
   return cats.length ? cats[0] : null;
 }
@@ -382,21 +406,12 @@ app.post("/chat", async (req, res) => {
     }
 
     const systemPrompt = `
-You are "Trucks Helper" — precise, friendly, and skimmable like ChatGPT.
-Write compact sections with emoji headers when useful:
-
-🧾 TL;DR — 1–2 crisp takeaways
-🔧 Steps — numbered/ordered steps when it's a how-to
-⚠️ Safety — bold, practical cautions right after steps
-🧠 Details — extra context, tips, alternatives
-➡️ Next — 1 short follow-up question to personalize
-
-Rules:
-- Use known vehicle details automatically; do NOT re-ask fitment more than once.
-- Prefer short lines over long paragraphs.
-- For HOW-TO: steps first, then safety.
-- No raw URLs; links will be injected after generation.
-- Keep it helpful and specific; avoid spam or generic upsells.`;
+You are "Trucks Helper" — precise, friendly, ChatGPT-like.
+Output plain, short lines only (no headings/emojis). I will add formatting later.
+For HOW-TO: list steps first, then safety notes.
+Use known vehicle details automatically; do NOT re-ask fitment more than once.
+No raw URLs; links are injected later.
+Avoid generic upsells; keep answers specific and helpful.`;
 
     const base = [{ role:"system", content:systemPrompt }, ...sess.history];
     const r = await client.chat.completions.create({
@@ -408,42 +423,30 @@ Rules:
     let reply = r?.choices?.[0]?.message?.content
       || (isGreetingOrSmallTalk(message) ? "• Hi! How can I help today?" : "• Tell me what you’re working on and I’ll jump in.");
 
-    // Build product links (only for real product intent)
-    let items = [];
-    if (!isGreetingOrSmallTalk(message)) {
-      items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 6 });
-      if (items.length) {
-        const linkTargets = items.map(it => ({
-          name: it.display,
-          url: buildAmazonSearchURL(it.query, { marketplace })
-        }));
-        reply = injectAffiliateLinks(reply, linkTargets);
+    // Build items (brands/products prioritized; categories last)
+    const items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 8 });
 
-        // Add a compact “You might consider” block ONCE
-        if (!/\nYou might consider:/i.test(reply)) {
-          const lines = items.map(it => tinySearchLineItem(it, marketplace));
-          reply = `${reply}\n\nYou might consider:\n${lines.join("\n")}`;
-        }
-      }
-    }
+    // Inline affiliate links ONLY for brand/prod (not categories)
+    const linkTargets = items
+      .filter(it => it.kind === "brand" || it.kind === "prod")
+      .map(it => ({ name: it.display, url: buildAmazonSearchURL(it.query, { marketplace }) }));
+    if (linkTargets.length) reply = injectAffiliateLinks(reply, linkTargets);
 
-    // ChatGPT-style polishing
-    const [core, ...tail] = reply.split("\n\nYou might consider:");
+    // No bottom "You might consider" block (removed for non-spammy feel)
+
+    // Section and polish
     const howto = looksLikeHowTo(message);
-    let styled = chatgptSections(core, { howto });
-
-    // Re-attach "You might consider" if present
-    if (tail.length) styled += "\n\nYou might consider:" + tail.join("\n\nYou might consider:");
+    let styled = chatgptSections(reply, { howto });
 
     // Add targeted follow-up
     styled += `\n\n➡️ Next\n${targetedFollowUp(message, vehicle, items)}`;
 
-    // For pure greeting, keep it very clean
+    // Pure greeting
     if (isGreetingOrSmallTalk(message)) {
       styled = "• Hi! How can I help today?\n\n• Parts, fitment, or a quick how-to?";
     }
 
-    // Optional upsell after HOW-TO (once) — phrased like ChatGPT
+    // Optional upsell after HOW-TO (once)
     if (howto && !sess.flags.offeredUpsellAfterHowTo) {
       styled += `\n• Want me to fetch a parts list for this job?`;
       sess.flags.offeredUpsellAfterHowTo = true;
