@@ -1,70 +1,48 @@
-// server.js — AMP/iOS-safe CORS + session memory + crisp liners + human follow-ups + inline product links only
-// - Strong CORS for AMP (echo Origin, AMP-Access-Control-Allow-Source-Origin, expose headers)
-// - Remembers vehicle per session (year/make/model/etc.); asks fitment only once if needed
-// - Replies are short, skimmable lines
-// - Affiliate links ONLY inline on real product names (no footer "View on Amazon" list)
-// - /widget endpoint works in normal pages and AMP <amp-iframe>
+// server.js — Chat + memory + targeted follow-ups + safe product links (no spam) + GEO (US/UK/CA)
+// - Strong CORS (Android/AMP-safe), OPTIONS preflight
+// - Remembers vehicle per session (year/make/model/etc.)
+// - Short, skimmable answers; follow-ups specific to the user’s query
+// - Affiliate links ONLY for product intent (not greetings, not generic tips)
+// - Fitment asked at most once per session
+// - No affiliate disclaimer in messages (you already show it in UI)
+// - /widget endpoint (works in normal + AMP <amp-iframe>)
 
 import "dotenv/config";
 import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
 
-// Keep if you have a tiny intent extractor
+// Optional: your own extractor (keep if present)
 import { extractIntent } from "./recommend.js";
 
 const app = express();
 app.use(bodyParser.json({ limit: "1mb" }));
 
-/* ---------- AMP/iOS-safe CORS ---------- */
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || [
-  "https://trucksenthusiasts.com",
-  "https://www.trucksenthusiasts.com",
-  "https://cdn.ampproject.org",
-  "https://*.ampproject.org"
-]).toString().split(",").map(s=>s.trim()).filter(Boolean);
+/* ---------------- CORS: robust for Android/AMP ---------------- */
+const RAW_ORIGINS = (process.env.ALLOWED_ORIGINS ||
+  "https://trucksenthusiasts.com,https://www.trucksenthusiasts.com,https://cdn.ampproject.org,https://*.ampproject.org,https://www.google.com"
+).split(",").map(s => s.trim()).filter(Boolean);
 
-function originMatches(origin) {
-  if (!origin) return true; // allow null-origin (some iOS/AMP cases)
-  return ALLOWED_ORIGINS.some(pat => {
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  return RAW_ORIGINS.some(pat => {
     if (pat.includes("*")) {
-      const re = new RegExp("^" + pat.replace(/\./g,"\\.").replace(/\*/g,".*") + "$");
+      const re = new RegExp("^" + pat.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
       return re.test(origin);
     }
-    return pat === origin;
+    return origin === pat;
   });
 }
-
-function getSourceOrigin(req) {
-  // AMP adds __amp_source_origin automatically to XHR; fallback to canonical site.
-  return (req.query && req.query.__amp_source_origin) || process.env.SOURCE_ORIGIN || "https://trucksenthusiasts.com";
-}
-
 app.use((req, res, next) => {
   const origin = req.headers.origin || "";
-  const ok = originMatches(origin);
-
-  if (ok) {
-    // Echo exact origin if present (AMP requirement); otherwise use canonical site
-    if (origin) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-    } else {
-      res.setHeader("Access-Control-Allow-Origin", process.env.SOURCE_ORIGIN || "https://trucksenthusiasts.com");
-    }
-    res.setHeader("Vary", "Origin, AMP-Source-Origin");
+  if (isAllowedOrigin(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+    res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
     res.setHeader("Access-Control-Allow-Credentials", "false");
-
-    // AMP-mandatory headers
-    const src = getSourceOrigin(req);
-    res.setHeader("AMP-Access-Control-Allow-Source-Origin", src);
-    res.setHeader("Access-Control-Expose-Headers", "AMP-Access-Control-Allow-Source-Origin");
   }
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
@@ -152,7 +130,6 @@ function escapeHtml(s = "") {
 
 /* ---------------- Product intent (brand-agnostic) ---------------- */
 const CATEGORY_TERMS = [
-  "suspension","suspension system",
   "cold air intake","air intake","intake","intake kit","intake filter","air filter",
   "tonneau cover","bed cover","retractable tonneau","tri-fold tonneau","hard folding cover","soft roll-up cover",
   "lift kit","leveling kit","shocks","struts","coilovers","springs",
@@ -169,12 +146,6 @@ function detectCategories(text=""){
   while ((m = CATEGORY_RE.exec(text)) !== null) set.add(m[1].toLowerCase());
   return [...set];
 }
-
-// Brands list so "Brand Model" counts as a product even with no digits.
-const TIRE_BRANDS = [
-  "Goodyear","BFGoodrich","Michelin","Bridgestone","Nitto","Toyo","Pirelli",
-  "Continental","Cooper","Yokohama","Falken","General","Hankook","Kumho","Nokian","Firestone","Dunlop"
-];
 
 const NON_PRODUCT_PHRASES = [
   "determine compatibility","choose type","research brands","read reviews",
@@ -199,10 +170,6 @@ function looksLikeVehicleOnly(phrase=""){
   if (/(f[\s-]?150|silverado|sierra|tacoma|tundra|ranger|ram\s?1500|gladiator|maverick|colorado|frontier)/i.test(phrase) && MAKES.some(m=>lc.includes(m))) return true;
   return false;
 }
-function startsWithTireBrand(phrase=""){
-  const first = (phrase.split(/\s+/)[0] || "").replace(/[^\w]/g,"");
-  return TIRE_BRANDS.includes(first);
-}
 function isProductishPhrase(phrase=""){
   const lc = phrase.toLowerCase();
   if (NON_PRODUCT_PHRASES.some(p => lc.includes(p))) return false;
@@ -210,8 +177,7 @@ function isProductishPhrase(phrase=""){
   const hasToken = PRODUCT_TOKENS.some(tok => lc.split(/\s+/).includes(tok)) ||
                    ["cold air intake","light bar","bed liner","floor mats","cat-back"].some(t => lc.includes(t));
   const hasAlphaNumMix = /\b(?:[a-z]*\d+[a-z]+|[a-z]+[0-9]+)\b/i.test(phrase) || /&/.test(phrase);
-  const brandModel = startsWithTireBrand(phrase) && phrase.trim().split(/\s+/).length >= 2;
-  return hasToken || hasAlphaNumMix || brandModel;
+  return hasToken || hasAlphaNumMix;
 }
 function harvestProductPhrases(text=""){
   if (!text) return [];
@@ -228,15 +194,15 @@ function isShoppingIntent(text=""){
   if (!text) return false;
   if (detectCategories(text).length) return true;
   if (harvestProductPhrases(text).length) return true;
-  return /\b(cover|intake|kit|pads?|rotors?|brake|shocks?|struts?|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter|suspension)\b/i.test(text);
+  return /\b(cover|intake|kit|pads?|rotors?|brake|shocks?|struts?|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter)\b/i.test(text);
 }
 
-/* ---------------- Safe link injection (inline products only) ---------------- */
+/* ---------------- Safe link injection ---------------- */
 function stripMarkdownBasic(s=""){return s
   .replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1")
   .replace(/^#+\s*(.+)$/gm,"$1").replace(/!\[[^\]]*\]\([^)]+\)/g,"")
   .replace(/\[[^\]]+\]\([^)]+\)/g,"$&");}
-const _STOP = new Set(["the","a","an","for","to","of","on","with","and","or","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great","kit","pads","brakes","suspension","system"]);
+const _STOP = new Set(["the","a","an","for","to","of","on","with","and","or","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great","kit","pads","brakes"]);
 const _norm = s => (s||"").toLowerCase().replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim();
 const _toks = s => _norm(s).split(" ").filter(t=>t&&!_STOP.has(t));
 function buildOrderedTokenRegex(name){ const ts=_toks(name); if(!ts.length) return null;
@@ -247,14 +213,11 @@ function protectAnchors(text){
   return { out, anchors };
 }
 function restoreAnchors(text, anchors){ return text.replace(/__A(\d+)__/g, (_,i)=>anchors[+i]); }
-
-// Only inline-link items where kind === "prod"
-function injectAffiliateLinks(replyText="", items=[]) {
-  if(!replyText || !items?.length) return replyText;
+function injectAffiliateLinks(replyText="", products=[]) {
+  if(!replyText || !products?.length) return replyText;
   let out = stripMarkdownBasic(replyText);
-  for (const it of items){
-    if (!it || it.kind === "cat") continue;
-    const url=it.url, full=it.name; if(!url||!full) continue;
+  for (const p of products){
+    const url=p?.url, full=p?.name; if(!url||!full) continue;
     let { out: noA, anchors } = protectAnchors(out);
     const tokenRe=buildOrderedTokenRegex(full);
     if(tokenRe && tokenRe.test(noA)){
@@ -271,13 +234,13 @@ function injectAffiliateLinks(replyText="", items=[]) {
   return out;
 }
 
-/* ---------------- Query extraction (products + categories) ---------------- */
+/* ---------------- Query extraction (products only) ---------------- */
 function vehicleString(v){ return [v?.year,v?.make,v?.model].filter(Boolean).join(" "); }
 function buildVehicleAwareQuery(vehicle, q) {
   const veh = vehicleString(vehicle);
   return [veh, q].filter(Boolean).join(" ").trim();
 }
-function buildQueryItems({ userMsg, modelReply, vehicle, max=8 }){
+function buildQueryItems({ userMsg, modelReply, vehicle, max=6 }){
   const items = [];
   const seen = new Set();
   for (const c of detectCategories(userMsg||"")) {
@@ -302,33 +265,17 @@ function buildQueryItems({ userMsg, modelReply, vehicle, max=8 }){
   }
   return items;
 }
-
-/* ---------------- Liners: force short, readable lines ---------------- */
-function toLiners(text=""){
-  if (!text) return text;
-  const raw = text
-    .replace(/\r/g,"")
-    .replace(/[•\u2022]/g,"• ")
-    .replace(/\n{2,}/g,"\n")
-    .replace(/(\d+)\.\s+/g, "$1) ")
-    .replace(/\s*-\s+/g, " — ");
-  const chunks = raw.split(/\n/).flatMap(line => {
-    return line
-      .split(/(?<=[.!?])\s+(?=[A-Z0-9])|(?<=\))\s+|(?<=—)\s+/)
-      .map(s => s.trim()).filter(Boolean);
-  });
-  const bullets = [];
-  for (let s of chunks) {
-    const parts = s.split(/\s—\s/).map(p=>p.trim()).filter(Boolean);
-    for (const p of parts) {
-      const line = p.startsWith("•") ? p : `• ${p}`;
-      bullets.push(line);
-    }
-  }
-  return bullets.filter((l,i,a)=> i===0 || l !== a[i-1]).join("\n");
+function tinySearchLineItem(item, marketplace){
+  const url = buildAmazonSearchURL(item.query, { marketplace });
+  return `• ${escapeHtml(item.display)} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
-/* ---------------- Targeted follow-ups (human phrasing) ---------------- */
+/* ---------------- Small lines + targeted follow-ups ---------------- */
+function toBullets(text=""){
+  const parts = text.replace(/\s+/g," ").split(/(?<=[\.!?])\s+(?=[A-Z0-9])/).map(s=>s.trim()).filter(Boolean);
+  if (!parts.length) return text.startsWith("•") ? text : `• ${text}`;
+  return parts.map(l => l.startsWith("•") ? l : `• ${l}`).join("\n");
+}
 function primaryCategoryFrom(items, userMsg){
   if (items && items.length) return items[0].display.toLowerCase();
   const cats = detectCategories(userMsg||"");
@@ -336,67 +283,35 @@ function primaryCategoryFrom(items, userMsg){
 }
 function targetedFollowUp(userMsg, vehicle, items){
   const cat = primaryCategoryFrom(items, userMsg);
-  const veh = vehicleString(vehicle);
-
   if (!cat) {
     if (looksLikeHowTo(userMsg)) {
-      return veh
-        ? "• If you want, I can pull parts and torque specs that fit your setup."
-        : "• If you share your year/make/model, I can pull parts and torque specs that fit.";
+      return vehicleString(vehicle)
+        ? "• Want me to pull parts and torque specs for your setup?"
+        : "• Want me to pull parts and torque specs that fit your truck?";
     }
-    return "• If you tell me your budget or a brand you like, I’ll narrow it for you.";
+    return "• Any budget or brand you prefer?";
   }
-
-  if (cat.includes("suspension") || cat.includes("lift") || cat.includes("level")) {
-    return [
-      "• What **lift/level height** are you aiming for (e.g., 1–2\", 3–4\")?",
-      "• **2WD or 4WD**, and keep factory ride or firmer?",
-      "• Planned **wheel/tire size + offset** (helps with clearance)?",
-      "• Any budget range I should stay within?"
-    ].join("\n");
-  }
+  // Category-specific follow-ups
   if (cat.includes("tuner") || cat.includes("programmer")) {
-    return [
-      "• Which **engine** (2.7/3.5 EcoBoost, 5.0)?",
-      "• Goal: **power**, **MPG**, or **tow**?",
-      "• Preloaded tunes only or **custom dyno** later?",
-      "• Ballpark budget?"
-    ].join("\n");
+    return "• Which engine (e.g., 2.7L/3.5L EcoBoost, 5.0)? • More power or MPG? • Budget range?";
   }
-  if (cat.includes("intake")) {
-    return [
-      "• **Open** (more sound) or **sealed box** (quieter/better IATs)?",
-      "• Planning a **tune** soon?",
-      "• **Dry** vs **oiled** filter?"
-    ].join("\n");
-  }
-  if (cat.includes("brake")) {
-    return [
-      "• Daily, **towing**, or spirited?",
-      "• **Low dust/quiet** or **max bite**?",
-      "• Okay with **slotted/drilled** or prefer plain?"
-    ].join("\n");
-  }
-  if (cat.includes("running") || cat.includes("nerf") || cat.includes("step")) {
-    return [
-      "• **Power-deploying** or **fixed**?",
-      "• Need **drop steps**?",
-      "• Finish: **black** or **stainless**?"
-    ].join("\n");
+  if (cat.includes("tire")) {
+    return "• Road, A/T, or M/T? • What size or wheel offset? • Noise vs grip preference?";
   }
   if (cat.includes("tonneau") || cat.includes("bed cover")) {
-    return [
-      "• **Hard** vs **soft**?",
-      "• **Tri-fold**, **roll-up**, or **retractable**?",
-      "• Priority: **security**, **weather seal**, or **price**?"
-    ].join("\n");
+    return "• Hard or soft? • Fold vs roll vs retract? • Priority: security, weather seal, or price?";
   }
-  if (cat.includes("tire") || cat.includes("wheels")) {
-    return [
-      "• Use case: **Highway**, **A/T**, or **M/T**?",
-      "• Desired **size** and **wheel offset** (I’ll check rubbing)?",
-      "• Preference: **low noise** or **maximum grip**?"
-    ].join("\n");
+  if (cat.includes("lift") || cat.includes("level")) {
+    return "• How much lift (inches)? • Ride comfort vs off-road? • Need UCAs or shocks too?";
+  }
+  if (cat.includes("brake")) {
+    return "• Daily driving or towing? • Looking for low dust or max bite? • Slot/drilled rotors okay?";
+  }
+  if (cat.includes("intake")) {
+    return "• Open or sealed box? • Sound level okay? • Planning a tune later?";
+  }
+  if (cat.includes("running") || cat.includes("nerf") || cat.includes("step")) {
+    return "• Power-deploying or fixed? • Drop step needed? • Coated black or stainless?";
   }
   return "• Any must-have features or a target budget?";
 }
@@ -445,9 +360,9 @@ app.post("/chat", async (req, res) => {
 
     const systemPrompt = `
 You are "Trucks Helper" — precise, friendly, human.
-Write short, skimmable lines (bullets). Avoid long paragraphs.
-For HOW-TO: steps first, then safety notes.
-Use known vehicle details; do not re-ask fitment more than once.
+Write short lines. Prefer bullets. Avoid long paragraphs.
+For HOW-TO: steps first, safety notes next.
+Use known vehicle details automatically. Do not re-ask fitment more than once.
 No raw URLs; links are injected later.`;
 
     const base = [{ role:"system", content:systemPrompt }, ...sess.history];
@@ -460,29 +375,34 @@ No raw URLs; links are injected later.`;
     let reply = r?.choices?.[0]?.message?.content
       || (isGreetingOrSmallTalk(message) ? "• Hi! How can I help today?" : "• Tell me what you’re working on and I’ll jump in.");
 
-    // Build link targets (products + categories), but only inline-link products; NO footer list.
+    // Only attach product links for real product intent
     let items = [];
     if (!isGreetingOrSmallTalk(message)) {
-      items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 8 });
-
+      items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 6 });
       if (items.length) {
         const linkTargets = items.map(it => ({
           name: it.display,
-          url: buildAmazonSearchURL(it.query, { marketplace }),
-          kind: it.kind
+          url: buildAmazonSearchURL(it.query, { marketplace })
         }));
-        // Inline links for products only (kind !== "cat")
         reply = injectAffiliateLinks(reply, linkTargets);
+
+        // Add a compact “You might consider” block ONCE
+        if (!/\nYou might consider:/i.test(reply)) {
+          const lines = items.map(it => tinySearchLineItem(it, marketplace));
+          reply = `${reply}\n\nYou might consider:\n${lines.join("\n")}`;
+        }
       }
     }
 
-    // Liners + targeted follow-up
-    let small = toLiners(reply);
-    small += `\n\n${toLiners(targetedFollowUp(message, vehicle, items))}`;
+    // Make it skimmable + targeted follow-up (no generic “what are you working on”)
+    const [core, ...tail] = reply.split("\n\nYou might consider:");
+    let small = toBullets(core);
+    if (tail.length) small += "\n\nYou might consider:" + tail.join("\n\nYou might consider:");
+    small += `\n\n${targetedFollowUp(message, vehicle, items)}`;
 
-    // Pure greeting: super clean
+    // For pure greeting, keep it very clean
     if (isGreetingOrSmallTalk(message)) {
-      small = "• Hi! How can I help today?\n• Parts, fitment, or a quick how-to — ask away.";
+      small = "• Hi! How can I help today?\n\n• Parts, fitment, or a quick how-to?";
     }
 
     // Optional upsell after HOW-TO (once)
@@ -515,7 +435,7 @@ header{display:flex;gap:10px;align-items:center;padding:12px;background:var(--pa
 header .logo{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--accent);font-size:16px}
 #msgs{flex:1;overflow:auto;padding:12px}
 .msg{margin:8px 0}.who{font-size:11px;opacity:.7;margin-bottom:4px}
-.bubble{background:#141a22;border:1px solid var(--border);border-radius:12px;padding:10px 12px;white-space:pre-wrap}
+.bubble{background:#141a22;border:1px solid var(--border);border-radius:12px;padding:10px 12px}
 .me .bubble{background:rgba(31,111,235,.1);border-color:#2a3b52}
 form{display:flex;gap:8px;padding:10px;background:var(--panel);border-top:1px solid var(--border)}
 input{flex:1;border:1px solid #2a3b52;border-radius:10px;background:var(--bg);color:var(--text);padding:10px}
@@ -559,7 +479,7 @@ a{color:var(--muted);text-decoration:underline}
     return {node:d, stop:()=>clearInterval(id)};
   }
 
-  add('AI',"• Hi! I’m your AI truck helper.\n• Parts, fitment, or a quick how-to — ask away.");
+  add('AI',"• Hi! I’m your AI truck helper.\\n• Parts, fitment, or a quick how-to — ask away.");
 
   $f.addEventListener('submit', async e=>{
     e.preventDefault();
