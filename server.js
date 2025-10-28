@@ -1,10 +1,8 @@
-// server.js — Chat + memory + targeted follow-ups + safe product links (no spam) + GEO (US/UK/CA)
+// server.js — ChatGPT-style answers + memory + targeted follow-ups + safe product links + GEO (US/UK/CA)
 // - Strong CORS (Android/AMP-safe), OPTIONS preflight
-// - Remembers vehicle per session (year/make/model/etc.)
-// - Short, skimmable answers; follow-ups specific to the user’s query
-// - Affiliate links ONLY for product intent (not greetings, not generic tips)
-// - Fitment asked at most once per session
-// - No affiliate disclaimer in messages (you already show it in UI)
+// - Remembers vehicle per session (year/make/model/etc.); asks fitment at most once
+// - ChatGPT-like sectioned replies (TL;DR / Steps / Safety / Next)
+// - Affiliate links ONLY for product intent (not greetings / general advice)
 // - /widget endpoint (works in normal + AMP <amp-iframe>)
 
 import "dotenv/config";
@@ -12,7 +10,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
 
-// Optional: your own extractor (keep if present)
+// Optional: your own extractor (leave as-is if present)
 import { extractIntent } from "./recommend.js";
 
 const app = express();
@@ -201,7 +199,7 @@ function isShoppingIntent(text=""){
 function stripMarkdownBasic(s=""){return s
   .replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1")
   .replace(/^#+\s*(.+)$/gm,"$1").replace(/!\[[^\]]*\]\([^)]+\)/g,"")
-  .replace(/\[[^\]]+\]\([^)]+\)/g,"$&");}
+  .replace(/\[[^\]]+\]\([^)]+\)/g,"$&");} // keep inline links; we later protect/restore anchors
 const _STOP = new Set(["the","a","an","for","to","of","on","with","and","or","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great","kit","pads","brakes"]);
 const _norm = s => (s||"").toLowerCase().replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim();
 const _toks = s => _norm(s).split(" ").filter(t=>t&&!_STOP.has(t));
@@ -270,11 +268,37 @@ function tinySearchLineItem(item, marketplace){
   return `• ${escapeHtml(item.display)} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
-/* ---------------- Small lines + targeted follow-ups ---------------- */
+/* ---------------- ChatGPT-like formatting helpers ---------------- */
 function toBullets(text=""){
   const parts = text.replace(/\s+/g," ").split(/(?<=[\.!?])\s+(?=[A-Z0-9])/).map(s=>s.trim()).filter(Boolean);
   if (!parts.length) return text.startsWith("•") ? text : `• ${text}`;
   return parts.map(l => l.startsWith("•") ? l : `• ${l}`).join("\n");
+}
+function chatgptSections(core, { howto=false } = {}) {
+  // Create compact, skimmable sections like ChatGPT responses.
+  let out = "";
+  const lines = core.split(/\n+/).map(s=>s.trim()).filter(Boolean);
+
+  // Build TL;DR from the first 1–2 lines
+  const tldr = lines.slice(0,2).join(" ");
+  out += `🧾 TL;DR\n${toBullets(tldr)}\n\n`;
+
+  // Steps section if it's a how-to or looks procedural
+  if (howto) {
+    const stepLines = lines.filter(l => /step|install|replace|check|do|start|stop|tighten|measure/i.test(l));
+    if (stepLines.length) {
+      out += `🔧 Steps\n${stepLines.map(l=>l.startsWith("•")?l:`• ${l}`).join("\n")}\n\n`;
+    }
+    // Safety heuristics
+    const safety = lines.filter(l => /safety|wear|gloves|eye|torque|support|jack|disconnect|cool|hot|warning|caution/i.test(l));
+    if (safety.length) out += `⚠️ Safety\n${safety.map(l=>l.startsWith("•")?l:`• ${l}`).join("\n")}\n\n`;
+  }
+
+  // General guidance bundle
+  const rest = lines.slice(2).filter(l=>l && !/^•?\s*(You might consider:)/i.test(l));
+  if (rest.length) out += `🧠 Details\n${rest.map(l=>l.startsWith("•")?l:`• ${l}`).join("\n")}`;
+
+  return out.trim();
 }
 function primaryCategoryFrom(items, userMsg){
   if (items && items.length) return items[0].display.toLowerCase();
@@ -291,7 +315,6 @@ function targetedFollowUp(userMsg, vehicle, items){
     }
     return "• Any budget or brand you prefer?";
   }
-  // Category-specific follow-ups
   if (cat.includes("tuner") || cat.includes("programmer")) {
     return "• Which engine (e.g., 2.7L/3.5L EcoBoost, 5.0)? • More power or MPG? • Budget range?";
   }
@@ -359,11 +382,21 @@ app.post("/chat", async (req, res) => {
     }
 
     const systemPrompt = `
-You are "Trucks Helper" — precise, friendly, human.
-Write short lines. Prefer bullets. Avoid long paragraphs.
-For HOW-TO: steps first, safety notes next.
-Use known vehicle details automatically. Do not re-ask fitment more than once.
-No raw URLs; links are injected later.`;
+You are "Trucks Helper" — precise, friendly, and skimmable like ChatGPT.
+Write compact sections with emoji headers when useful:
+
+🧾 TL;DR — 1–2 crisp takeaways
+🔧 Steps — numbered/ordered steps when it's a how-to
+⚠️ Safety — bold, practical cautions right after steps
+🧠 Details — extra context, tips, alternatives
+➡️ Next — 1 short follow-up question to personalize
+
+Rules:
+- Use known vehicle details automatically; do NOT re-ask fitment more than once.
+- Prefer short lines over long paragraphs.
+- For HOW-TO: steps first, then safety.
+- No raw URLs; links will be injected after generation.
+- Keep it helpful and specific; avoid spam or generic upsells.`;
 
     const base = [{ role:"system", content:systemPrompt }, ...sess.history];
     const r = await client.chat.completions.create({
@@ -375,7 +408,7 @@ No raw URLs; links are injected later.`;
     let reply = r?.choices?.[0]?.message?.content
       || (isGreetingOrSmallTalk(message) ? "• Hi! How can I help today?" : "• Tell me what you’re working on and I’ll jump in.");
 
-    // Only attach product links for real product intent
+    // Build product links (only for real product intent)
     let items = [];
     if (!isGreetingOrSmallTalk(message)) {
       items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 6 });
@@ -394,25 +427,30 @@ No raw URLs; links are injected later.`;
       }
     }
 
-    // Make it skimmable + targeted follow-up (no generic “what are you working on”)
+    // ChatGPT-style polishing
     const [core, ...tail] = reply.split("\n\nYou might consider:");
-    let small = toBullets(core);
-    if (tail.length) small += "\n\nYou might consider:" + tail.join("\n\nYou might consider:");
-    small += `\n\n${targetedFollowUp(message, vehicle, items)}`;
+    const howto = looksLikeHowTo(message);
+    let styled = chatgptSections(core, { howto });
+
+    // Re-attach "You might consider" if present
+    if (tail.length) styled += "\n\nYou might consider:" + tail.join("\n\nYou might consider:");
+
+    // Add targeted follow-up
+    styled += `\n\n➡️ Next\n${targetedFollowUp(message, vehicle, items)}`;
 
     // For pure greeting, keep it very clean
     if (isGreetingOrSmallTalk(message)) {
-      small = "• Hi! How can I help today?\n\n• Parts, fitment, or a quick how-to?";
+      styled = "• Hi! How can I help today?\n\n• Parts, fitment, or a quick how-to?";
     }
 
-    // Optional upsell after HOW-TO (once)
-    if (looksLikeHowTo(message) && !sess.flags.offeredUpsellAfterHowTo) {
-      small += `\n• Want me to fetch a parts list for this job?`;
+    // Optional upsell after HOW-TO (once) — phrased like ChatGPT
+    if (howto && !sess.flags.offeredUpsellAfterHowTo) {
+      styled += `\n• Want me to fetch a parts list for this job?`;
       sess.flags.offeredUpsellAfterHowTo = true;
     }
 
-    pushHistory(sess, "assistant", small);
-    return res.status(200).json({ reply: small });
+    pushHistory(sess, "assistant", styled);
+    return res.status(200).json({ reply: styled });
 
   } catch (e) {
     console.error("[/chat] error", e?.response?.data || e.message || e);
