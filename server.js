@@ -318,6 +318,50 @@ function bulletize(text=""){
     .filter(Boolean);
   return cleaned.map(l => `• ${l}`).join("\n");
 }
+// ---- category helper + follow-up prompts (paste above app.post("/chat", ...)) ----
+function primaryCategoryFrom(items, userMsg){
+  if (items && items.length) {
+    const i = items.find(it => it.kind === "cat");
+    if (i) return i.display.toLowerCase();
+  }
+  const cats = detectCategories(userMsg || "");
+  return cats.length ? cats[0] : null;
+}
+
+function targetedFollowUp(userMsg, vehicle, items){
+  const cat = primaryCategoryFrom(items, userMsg);
+  if (!cat) {
+    if (looksLikeHowTo(userMsg)) {
+      return vehicleString(vehicle)
+        ? "• Want me to pull parts and torque specs for your setup?"
+        : "• Want me to pull parts and torque specs that fit your truck?";
+    }
+    return "• Any budget or brand you prefer?";
+  }
+
+  if (cat.includes("tuner") || cat.includes("programmer")) {
+    return "• Which engine (e.g., 2.7L/3.5L EcoBoost, 5.0)? • More power or MPG? • Budget range?";
+  }
+  if (cat.includes("tire")) {
+    return "• Road, A/T, or M/T? • What size or wheel offset? • Noise vs grip preference?";
+  }
+  if (cat.includes("tonneau") || cat.includes("bed cover")) {
+    return "• Hard or soft? • Fold vs roll vs retract? • Priority: security, weather seal, or price?";
+  }
+  if (cat.includes("lift") || cat.includes("level")) {
+    return "• How much lift (inches)? • Ride comfort vs off-road? • Need UCAs or shocks too?";
+  }
+  if (cat.includes("brake")) {
+    return "• Daily driving or towing? • Looking for low dust or max bite? • Slot/drilled rotors okay?";
+  }
+  if (cat.includes("intake")) {
+    return "• Open or sealed box? • Sound level okay? • Planning a tune later?";
+  }
+  if (cat.includes("running") || cat.includes("nerf") || cat.includes("step")) {
+    return "• Power-deploying or fixed? • Drop step needed? • Coated black or stainless?";
+  }
+  return "• Any must-have features or a target budget?";
+}
 
 /* ---------------- Diagnostics ---------------- */
 app.get("/health", (_req,res)=>res.send("ok"));
