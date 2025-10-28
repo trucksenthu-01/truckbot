@@ -1,48 +1,70 @@
-// server.js — Chat + memory + crisp liners + human follow-ups + inline product links only + GEO (US/UK/CA)
-// - Strong CORS (Android/AMP-safe), OPTIONS preflight
-// - Remembers vehicle per session (year/make/model/etc.)
-// - Replies are short, skimmable lines (no big paragraphs)
+// server.js — AMP/iOS-safe CORS + session memory + crisp liners + human follow-ups + inline product links only
+// - Strong CORS for AMP (echo Origin, AMP-Access-Control-Allow-Source-Origin, expose headers)
+// - Remembers vehicle per session (year/make/model/etc.); asks fitment only once if needed
+// - Replies are short, skimmable lines
 // - Affiliate links ONLY inline on real product names (no footer "View on Amazon" list)
-// - One-time fitment ask per session
-// - No affiliate disclaimer text in replies
-// - /widget endpoint (works in normal + AMP <amp-iframe>)
+// - /widget endpoint works in normal pages and AMP <amp-iframe>
 
 import "dotenv/config";
 import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
 
-// keep if you have it
+// Keep if you have a tiny intent extractor
 import { extractIntent } from "./recommend.js";
 
 const app = express();
 app.use(bodyParser.json({ limit: "1mb" }));
 
-/* ---------------- CORS: robust for Android/AMP ---------------- */
-const RAW_ORIGINS = (process.env.ALLOWED_ORIGINS ||
-  "https://trucksenthusiasts.com,https://www.trucksenthusiasts.com,https://cdn.ampproject.org,https://*.ampproject.org,https://www.google.com"
-).split(",").map(s => s.trim()).filter(Boolean);
+/* ---------- AMP/iOS-safe CORS ---------- */
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || [
+  "https://trucksenthusiasts.com",
+  "https://www.trucksenthusiasts.com",
+  "https://cdn.ampproject.org",
+  "https://*.ampproject.org"
+]).toString().split(",").map(s=>s.trim()).filter(Boolean);
 
-function isAllowedOrigin(origin) {
-  if (!origin) return true; // same-origin, curl, some webviews
-  return RAW_ORIGINS.some(pat => {
+function originMatches(origin) {
+  if (!origin) return true; // allow null-origin (some iOS/AMP cases)
+  return ALLOWED_ORIGINS.some(pat => {
     if (pat.includes("*")) {
-      const re = new RegExp("^" + pat.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
+      const re = new RegExp("^" + pat.replace(/\./g,"\\.").replace(/\*/g,".*") + "$");
       return re.test(origin);
     }
-    return origin === pat;
+    return pat === origin;
   });
 }
+
+function getSourceOrigin(req) {
+  // AMP adds __amp_source_origin automatically to XHR; fallback to canonical site.
+  return (req.query && req.query.__amp_source_origin) || process.env.SOURCE_ORIGIN || "https://trucksenthusiasts.com";
+}
+
 app.use((req, res, next) => {
   const origin = req.headers.origin || "";
-  if (isAllowedOrigin(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin || "*");
-    res.setHeader("Vary", "Origin");
+  const ok = originMatches(origin);
+
+  if (ok) {
+    // Echo exact origin if present (AMP requirement); otherwise use canonical site
+    if (origin) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+    } else {
+      res.setHeader("Access-Control-Allow-Origin", process.env.SOURCE_ORIGIN || "https://trucksenthusiasts.com");
+    }
+    res.setHeader("Vary", "Origin, AMP-Source-Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
     res.setHeader("Access-Control-Allow-Credentials", "false");
+
+    // AMP-mandatory headers
+    const src = getSourceOrigin(req);
+    res.setHeader("AMP-Access-Control-Allow-Source-Origin", src);
+    res.setHeader("Access-Control-Expose-Headers", "AMP-Access-Control-Allow-Source-Origin");
   }
-  if (req.method === "OPTIONS") return res.sendStatus(204);
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
   next();
 });
 
@@ -148,7 +170,7 @@ function detectCategories(text=""){
   return [...set];
 }
 
-// Tire brands so "Brand Model" counts as a product even with no digits.
+// Brands list so "Brand Model" counts as a product even with no digits.
 const TIRE_BRANDS = [
   "Goodyear","BFGoodrich","Michelin","Bridgestone","Nitto","Toyo","Pirelli",
   "Continental","Cooper","Yokohama","Falken","General","Hankook","Kumho","Nokian","Firestone","Dunlop"
@@ -226,12 +248,12 @@ function protectAnchors(text){
 }
 function restoreAnchors(text, anchors){ return text.replace(/__A(\d+)__/g, (_,i)=>anchors[+i]); }
 
-// IMPORTANT: we accept "items" with { name, url, kind } and SKIP linking for kind === "cat".
+// Only inline-link items where kind === "prod"
 function injectAffiliateLinks(replyText="", items=[]) {
   if(!replyText || !items?.length) return replyText;
   let out = stripMarkdownBasic(replyText);
   for (const it of items){
-    if (!it || it.kind === "cat") continue; // only products get inline links
+    if (!it || it.kind === "cat") continue;
     const url=it.url, full=it.name; if(!url||!full) continue;
     let { out: noA, anchors } = protectAnchors(out);
     const tokenRe=buildOrderedTokenRegex(full);
@@ -454,7 +476,7 @@ No raw URLs; links are injected later.`;
       }
     }
 
-    // Liners + targeted follow-up (no "You might consider" block anymore)
+    // Liners + targeted follow-up
     let small = toLiners(reply);
     small += `\n\n${toLiners(targetedFollowUp(message, vehicle, items))}`;
 
