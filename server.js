@@ -1,8 +1,9 @@
-// server.js — Chat + memory + targeted follow-ups + safe product links (no spam) + GEO (US/UK/CA)
+// server.js — Chat + memory + crisp liners + human follow-ups + safe product links + GEO (US/UK/CA)
 // - Strong CORS (Android/AMP-safe), OPTIONS preflight
 // - Remembers vehicle per session (year/make/model/etc.)
-// - Short, skimmable answers; follow-ups specific to the user’s query
-// - Affiliate links ONLY for product intent (not greetings, not generic tips)
+// - Replies are converted to short, skimmable lines (no big paragraphs)
+// - Follow-ups are category-aware and conversational (not generic)
+// - Affiliate links ONLY for product intent (never generic phrases)
 // - Fitment asked at most once per session
 // - No affiliate disclaimer in messages (you already show it in UI)
 // - /widget endpoint (works in normal + AMP <amp-iframe>)
@@ -12,7 +13,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
 
-// Optional: your own extractor (keep if present)
+// Optional: keep your extractor if present
 import { extractIntent } from "./recommend.js";
 
 const app = express();
@@ -24,7 +25,7 @@ const RAW_ORIGINS = (process.env.ALLOWED_ORIGINS ||
 ).split(",").map(s => s.trim()).filter(Boolean);
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true;
+  if (!origin) return true; // same-origin, curl, some webviews
   return RAW_ORIGINS.some(pat => {
     if (pat.includes("*")) {
       const re = new RegExp("^" + pat.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$");
@@ -130,6 +131,7 @@ function escapeHtml(s = "") {
 
 /* ---------------- Product intent (brand-agnostic) ---------------- */
 const CATEGORY_TERMS = [
+  "suspension","suspension system",
   "cold air intake","air intake","intake","intake kit","intake filter","air filter",
   "tonneau cover","bed cover","retractable tonneau","tri-fold tonneau","hard folding cover","soft roll-up cover",
   "lift kit","leveling kit","shocks","struts","coilovers","springs",
@@ -194,7 +196,7 @@ function isShoppingIntent(text=""){
   if (!text) return false;
   if (detectCategories(text).length) return true;
   if (harvestProductPhrases(text).length) return true;
-  return /\b(cover|intake|kit|pads?|rotors?|brake|shocks?|struts?|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter)\b/i.test(text);
+  return /\b(cover|intake|kit|pads?|rotors?|brake|shocks?|struts?|tire|wheel|nerf|running|step|winch|tuner|mat|liner|rack|headlight|taillight|exhaust|filter|suspension)\b/i.test(text);
 }
 
 /* ---------------- Safe link injection ---------------- */
@@ -202,7 +204,7 @@ function stripMarkdownBasic(s=""){return s
   .replace(/(\*{1,3})([^*]+)\1/g,"$2").replace(/`([^`]+)`/g,"$1")
   .replace(/^#+\s*(.+)$/gm,"$1").replace(/!\[[^\]]*\]\([^)]+\)/g,"")
   .replace(/\[[^\]]+\]\([^)]+\)/g,"$&");}
-const _STOP = new Set(["the","a","an","for","to","of","on","with","and","or","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great","kit","pads","brakes"]);
+const _STOP = new Set(["the","a","an","for","to","of","on","with","and","or","cover","covers","tonneau","truck","bed","ford","ram","chevy","gmc","toyota","best","good","great","kit","pads","brakes","suspension","system"]);
 const _norm = s => (s||"").toLowerCase().replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim();
 const _toks = s => _norm(s).split(" ").filter(t=>t&&!_STOP.has(t));
 function buildOrderedTokenRegex(name){ const ts=_toks(name); if(!ts.length) return null;
@@ -270,12 +272,40 @@ function tinySearchLineItem(item, marketplace){
   return `• ${escapeHtml(item.display)} 👉 <a href="${url}" target="_blank" rel="nofollow sponsored noopener">View on Amazon</a>`;
 }
 
-/* ---------------- Small lines + targeted follow-ups ---------------- */
-function toBullets(text=""){
-  const parts = text.replace(/\s+/g," ").split(/(?<=[\.!?])\s+(?=[A-Z0-9])/).map(s=>s.trim()).filter(Boolean);
-  if (!parts.length) return text.startsWith("•") ? text : `• ${text}`;
-  return parts.map(l => l.startsWith("•") ? l : `• ${l}`).join("\n");
+/* ---------------- Liners: force short, readable lines ---------------- */
+// Turns paragraphs, numbered lists, and dash lists into crisp bullets.
+// Splits on punctuation, list markers, and " - " explanations.
+function toLiners(text=""){
+  if (!text) return text;
+  // Normalize newlines, split aggressively
+  const raw = text
+    .replace(/\r/g,"")
+    .replace(/[•\u2022]/g,"• ")                 // keep existing bullets
+    .replace(/\n{2,}/g,"\n")                    // compress blank lines
+    .replace(/(\d+)\.\s+/g, "$1) ")             // 1. -> 1)
+    .replace(/\s*-\s+/g, " — ");                // dash explanations
+
+  const chunks = raw.split(/\n/).flatMap(line => {
+    // Split sentences and semi-colon-ish boundaries
+    return line
+      .split(/(?<=[.!?])\s+(?=[A-Z0-9])|(?<=\))\s+|(?<=—)\s+/)
+      .map(s => s.trim()).filter(Boolean);
+  });
+
+  const bullets = [];
+  for (let s of chunks) {
+    // Split further on " — " to avoid long lines
+    const parts = s.split(/\s—\s/).map(p=>p.trim()).filter(Boolean);
+    for (const p of parts) {
+      const line = p.startsWith("•") ? p : `• ${p}`;
+      bullets.push(line);
+    }
+  }
+  // Deduplicate adjacent identical bullets
+  return bullets.filter((l,i,a)=> i===0 || l !== a[i-1]).join("\n");
 }
+
+/* ---------------- Targeted follow-ups (human phrasing) ---------------- */
 function primaryCategoryFrom(items, userMsg){
   if (items && items.length) return items[0].display.toLowerCase();
   const cats = detectCategories(userMsg||"");
@@ -283,35 +313,69 @@ function primaryCategoryFrom(items, userMsg){
 }
 function targetedFollowUp(userMsg, vehicle, items){
   const cat = primaryCategoryFrom(items, userMsg);
+  const veh = vehicleString(vehicle);
+
+  // If no clear category, fall back to gentle, helpful nudge
   if (!cat) {
     if (looksLikeHowTo(userMsg)) {
-      return vehicleString(vehicle)
-        ? "• Want me to pull parts and torque specs for your setup?"
-        : "• Want me to pull parts and torque specs that fit your truck?";
+      return veh
+        ? "• If you want, I can pull parts and torque specs that fit your setup."
+        : "• If you share your year/make/model, I can pull parts and torque specs that fit.";
     }
-    return "• Any budget or brand you prefer?";
+    return "• If you tell me your budget or a brand you like, I’ll narrow it for you.";
   }
-  // Category-specific follow-ups
+
+  // Category-specific, conversational follow-ups
+  if (cat.includes("suspension") || cat.includes("lift") || cat.includes("level")) {
+    return [
+      "• What **lift or level height** are you aiming for (e.g., 1–2\", 3–4\")?",
+      "• Is your truck **2WD or 4WD**, and do you want to **retain factory ride** or firm it up?",
+      "• What **wheel/tire size and offset** are you planning? That decides clearance and UCA needs.",
+      "• Any budget range I should stay within?"
+    ].join("\n");
+  }
   if (cat.includes("tuner") || cat.includes("programmer")) {
-    return "• Which engine (e.g., 2.7L/3.5L EcoBoost, 5.0)? • More power or MPG? • Budget range?";
-  }
-  if (cat.includes("tire")) {
-    return "• Road, A/T, or M/T? • What size or wheel offset? • Noise vs grip preference?";
-  }
-  if (cat.includes("tonneau") || cat.includes("bed cover")) {
-    return "• Hard or soft? • Fold vs roll vs retract? • Priority: security, weather seal, or price?";
-  }
-  if (cat.includes("lift") || cat.includes("level")) {
-    return "• How much lift (inches)? • Ride comfort vs off-road? • Need UCAs or shocks too?";
-  }
-  if (cat.includes("brake")) {
-    return "• Daily driving or towing? • Looking for low dust or max bite? • Slot/drilled rotors okay?";
+    return [
+      "• Which **engine** (2.7L/3.5L EcoBoost, 5.0 Coyote)?",
+      "• Are you chasing **power**, **MPG**, or a **tow tune**?",
+      "• Do you want **preloaded tunes** only or room for **custom dyno tunes**?",
+      "• Ballpark budget?"
+    ].join("\n");
   }
   if (cat.includes("intake")) {
-    return "• Open or sealed box? • Sound level okay? • Planning a tune later?";
+    return [
+      "• Do you prefer an **open** intake (more sound) or a **sealed box** (quieter, better IATs)?",
+      "• Any plan to add a **tune** soon?",
+      "• Want **washable** filter or **oiled**?"
+    ].join("\n");
+  }
+  if (cat.includes("brake")) {
+    return [
+      "• Daily commute, **towing**, or spirited use?",
+      "• Priority on **low dust/quiet** or **max bite**?",
+      "• Okay with **slotted/drilled rotors**, or prefer plain?"
+    ].join("\n");
   }
   if (cat.includes("running") || cat.includes("nerf") || cat.includes("step")) {
-    return "• Power-deploying or fixed? • Drop step needed? • Coated black or stainless?";
+    return [
+      "• **Power-deploying** or **fixed** steps?",
+      "• Need **drop steps** for easier entry?",
+      "• Finish: **black coated** or **stainless**?"
+    ].join("\n");
+  }
+  if (cat.includes("tonneau") || cat.includes("bed cover")) {
+    return [
+      "• **Hard** vs **soft**?",
+      "• **Tri-fold**, **roll-up**, or **retractable**?",
+      "• Priority: **security**, **weather seal**, or **price**?"
+    ].join("\n");
+  }
+  if (cat.includes("tire")) {
+    return [
+      "• **Highway**, **A/T**, or **M/T** use mostly?",
+      "• Desired **size** and **wheel offset** (for rubbing check)?",
+      "• Preference: **low noise** or **maximum grip**?"
+    ].join("\n");
   }
   return "• Any must-have features or a target budget?";
 }
@@ -360,9 +424,9 @@ app.post("/chat", async (req, res) => {
 
     const systemPrompt = `
 You are "Trucks Helper" — precise, friendly, human.
-Write short lines. Prefer bullets. Avoid long paragraphs.
-For HOW-TO: steps first, safety notes next.
-Use known vehicle details automatically. Do not re-ask fitment more than once.
+Write short, skimmable lines (bullets). Avoid long paragraphs.
+For HOW-TO: steps first, then safety notes.
+Use known vehicle details; do not re-ask fitment more than once.
 No raw URLs; links are injected later.`;
 
     const base = [{ role:"system", content:systemPrompt }, ...sess.history];
@@ -375,7 +439,7 @@ No raw URLs; links are injected later.`;
     let reply = r?.choices?.[0]?.message?.content
       || (isGreetingOrSmallTalk(message) ? "• Hi! How can I help today?" : "• Tell me what you’re working on and I’ll jump in.");
 
-    // Only attach product links for real product intent
+    // Product links (only for real product/category intent)
     let items = [];
     if (!isGreetingOrSmallTalk(message)) {
       items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 6 });
@@ -386,7 +450,7 @@ No raw URLs; links are injected later.`;
         }));
         reply = injectAffiliateLinks(reply, linkTargets);
 
-        // Add a compact “You might consider” block ONCE
+        // Compact helper block (once)
         if (!/\nYou might consider:/i.test(reply)) {
           const lines = items.map(it => tinySearchLineItem(it, marketplace));
           reply = `${reply}\n\nYou might consider:\n${lines.join("\n")}`;
@@ -394,15 +458,15 @@ No raw URLs; links are injected later.`;
       }
     }
 
-    // Make it skimmable + targeted follow-up (no generic “what are you working on”)
+    // Convert to clean liners + attach targeted follow-up
     const [core, ...tail] = reply.split("\n\nYou might consider:");
-    let small = toBullets(core);
-    if (tail.length) small += "\n\nYou might consider:" + tail.join("\n\nYou might consider:");
-    small += `\n\n${targetedFollowUp(message, vehicle, items)}`;
+    let small = toLiners(core);
+    if (tail.length) small += "\n\nYou might consider:" + toLiners(tail.join("\n\nYou might consider:"));
+    small += `\n\n${toLiners(targetedFollowUp(message, vehicle, items))}`;
 
-    // For pure greeting, keep it very clean
+    // Pure greeting: keep it super clean
     if (isGreetingOrSmallTalk(message)) {
-      small = "• Hi! How can I help today?\n\n• Parts, fitment, or a quick how-to?";
+      small = "• Hi! How can I help today?\n• Parts, fitment, or a quick how-to — ask away.";
     }
 
     // Optional upsell after HOW-TO (once)
@@ -435,7 +499,7 @@ header{display:flex;gap:10px;align-items:center;padding:12px;background:var(--pa
 header .logo{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--accent);font-size:16px}
 #msgs{flex:1;overflow:auto;padding:12px}
 .msg{margin:8px 0}.who{font-size:11px;opacity:.7;margin-bottom:4px}
-.bubble{background:#141a22;border:1px solid var(--border);border-radius:12px;padding:10px 12px}
+.bubble{background:#141a22;border:1px solid var(--border);border-radius:12px;padding:10px 12px;white-space:pre-wrap}
 .me .bubble{background:rgba(31,111,235,.1);border-color:#2a3b52}
 form{display:flex;gap:8px;padding:10px;background:var(--panel);border-top:1px solid var(--border)}
 input{flex:1;border:1px solid #2a3b52;border-radius:10px;background:var(--bg);color:var(--text);padding:10px}
@@ -479,7 +543,7 @@ a{color:var(--muted);text-decoration:underline}
     return {node:d, stop:()=>clearInterval(id)};
   }
 
-  add('AI',"• Hi! I’m your AI truck helper.\\n• Parts, fitment, or a quick how-to — ask away.");
+  add('AI',"• Hi! I’m your AI truck helper.\n• Parts, fitment, or a quick how-to — ask away.");
 
   $f.addEventListener('submit', async e=>{
     e.preventDefault();
