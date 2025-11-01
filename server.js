@@ -1,14 +1,17 @@
-// server.js — Chat bullets (no TL;DR) + memory + brand/product inline links + GEO + analytics hook
+// server.js — Chat bullets (no TL;DR) + memory + product-first affiliate links + GEO + analytics hook
 // - Strong CORS (Android/AMP-safe), OPTIONS preflight
 // - Remembers vehicle per session; asks fitment at most once
-// - Inline affiliate links ONLY on brand/product phrases (not generic words)
+// - Inline affiliate links: **product phrase first**, brand later (fixes “SCT” problem)
+// - If affiliateMap_enriched.json exists, uses real product URLs
 // - No “View on Amazon” block
-// - /widget endpoint (optional demo) and /analytics endpoint for simple tracking
+// - /widget endpoint (demo) and /analytics endpoint for simple tracking
 
 import "dotenv/config";
 import express from "express";
 import bodyParser from "body-parser";
 import OpenAI from "openai";
+import fs from "fs";
+import path from "path";
 
 // Optional: your extractor (kept as-is if present)
 import { extractIntent } from "./recommend.js";
@@ -48,6 +51,43 @@ app.use((req, res, next) => {
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MODEL  = process.env.MODEL || "gpt-4o-mini";
 const PORT   = process.env.PORT || 3000;
+
+/* ---------------- Optional affiliate map (for exact product URLs) ---------------- */
+function safeLoadJSON(p, fallback = []) {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch (e) {
+    console.warn("[server] Could not load", p, e.message);
+    return fallback;
+  }
+}
+const ROOT_AFF = path.resolve("./affiliateMap_enriched.json");
+const DATA_AFF = path.resolve("./data/affiliateMap_enriched.json");
+const affiliateMap = fs.existsSync(DATA_AFF)
+  ? safeLoadJSON(DATA_AFF, [])
+  : safeLoadJSON(ROOT_AFF, []);
+
+// Normalize product names inside map for matching
+const affIndex = new Map();
+if (Array.isArray(affiliateMap)) {
+  for (const item of affiliateMap) {
+    if (!item?.name || !item?.url) continue;
+    const key = item.name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    if (!affIndex.has(key)) affIndex.set(key, item.url);
+  }
+} else if (affiliateMap && typeof affiliateMap === "object") {
+  // if user stores as object name->url
+  for (const [name, url] of Object.entries(affiliateMap)) {
+    const key = name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    affIndex.set(key, url);
+  }
+}
+
+function lookupAffiliate(name = "") {
+  const key = name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  if (!key) return null;
+  return affIndex.get(key) || null;
+}
 
 /* ---------------- Session memory ---------------- */
 const SESSIONS = new Map(); // sessionId -> { history: [], vehicle:{}, flags:{} }
@@ -115,8 +155,11 @@ function resolveMarketplace(cc){ return (cc && COUNTRY_TO_TLD_LIMITED[cc]) ? COU
 function amazonDomainFromCC(cc="com"){ return `https://www.amazon.${(cc||"com").toLowerCase()}`; }
 function buildAmazonSearchURL(query,{tag,marketplace}={}) {
   const base = amazonDomainFromCC(marketplace || process.env.AMAZON_MARKETPLACE || "com");
-  const params = new URLSearchParams(); params.set("k", query);
-  const assoc = tag || process.env.AFFILIATE_TAG; if (assoc) params.set("tag", assoc);
+  // IMPORTANT: keep full product phrase in search, don't truncate to brand
+  const params = new URLSearchParams();
+  params.set("k", query);
+  const assoc = tag || process.env.AFFILIATE_TAG;
+  if (assoc) params.set("tag", assoc);
   return `${base}/s?${params.toString()}`;
 }
 function escapeHtml(s = "") {
@@ -127,7 +170,6 @@ function escapeHtml(s = "") {
 }
 
 /* ---------------- Product/brand detection ---------------- */
-/* Expanded brand list (tuners, intakes, exhausts, suspension, wheels/tires, mats, lighting, racks, winches, covers, brakes, steps, batteries) */
 const BRANDS = [
   // Tuners
   "SCT","DiabloSport","Bully Dog","Edge","Hypertech","Superchips",
@@ -253,8 +295,12 @@ function protectAnchors(text){
 function restoreAnchors(text, anchors){ return text.replace(/__A(\d+)__/g, (_,i)=>anchors[+i]); }
 function injectAffiliateLinks(replyText="", products=[]) {
   if(!replyText || !products?.length) return replyText;
+
+  // IMPORTANT: link LONGEST names first, so "SCT X4 Power Flash Programmer" wins over "SCT"
+  const sorted = [...products].sort((a,b) => (b.name?.length || 0) - (a.name?.length || 0));
+
   let out = stripMarkdownBasic(replyText);
-  for (const p of products){
+  for (const p of sorted){
     const url=p?.url, full=p?.name; if(!url||!full) continue;
     let { out: noA, anchors } = protectAnchors(out);
     const tokenRe=buildOrderedTokenRegex(full);
@@ -276,7 +322,8 @@ function injectAffiliateLinks(replyText="", products=[]) {
 function vehicleString(v){ return [v?.year,v?.make,v?.model].filter(Boolean).join(" "); }
 function buildVehicleAwareQuery(vehicle, q) {
   const veh = vehicleString(vehicle);
-  return [veh, q].filter(Boolean).join(" ").trim();
+  // For specific product phrases, we actually want the product FIRST
+  return [q, veh].filter(Boolean).join(" ").trim();
 }
 function buildQueryItems({ userMsg, modelReply, vehicle, max=8 }){
   const items = [];
@@ -287,20 +334,20 @@ function buildQueryItems({ userMsg, modelReply, vehicle, max=8 }){
   const cats = [...new Set([...catsUser, ...catsReply])];
   const primaryCat = cats[0] || "";
 
-  // Brands first
+  // 1) Product phrases FIRST (this is the key change)
+  for (const p of new Set([...harvestProductPhrases(userMsg||""), ...harvestProductPhrases(modelReply||"")])) {
+    const key = `prod:${p.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
+    items.push({ display: p, query: buildVehicleAwareQuery(vehicle, p), kind: "prod" });
+    if (items.length >= max) return items;
+  }
+  // 2) Brands
   for (const b of new Set([...detectBrands(userMsg||""), ...detectBrands(modelReply||"")])) {
     const key = `brand:${b.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
     const q = buildVehicleAwareQuery(vehicle, (primaryCat ? `${b} ${primaryCat}` : b));
     items.push({ display: b, query: q, kind: "brand" });
     if (items.length >= max) return items;
   }
-  // Product phrases next
-  for (const p of new Set([...harvestProductPhrases(userMsg||""), ...harvestProductPhrases(modelReply||"")])) {
-    const key = `prod:${p.toLowerCase()}`; if (seen.has(key)) continue; seen.add(key);
-    items.push({ display: p, query: buildVehicleAwareQuery(vehicle, p), kind: "prod" });
-    if (items.length >= max) return items;
-  }
-  // Categories last (for follow-ups, not linked)
+  // 3) Categories last
   for (const c of cats) {
     const key = `cat:${c}`; if (seen.has(key)) continue; seen.add(key);
     items.push({ display: c, query: buildVehicleAwareQuery(vehicle, c), kind: "cat" });
@@ -311,7 +358,6 @@ function buildQueryItems({ userMsg, modelReply, vehicle, max=8 }){
 
 /* ---------------- Formatting: NO TL;DR, clean bullets ---------------- */
 function stripModelHeaders(s=""){
-  // Remove any headers the model might add (TL;DR / Steps / Safety / Details / You might consider)
   return (s||"")
     .replace(/^\s*(🧾\s*)?TL;?\s*DR.*$/gmi, "")
     .replace(/^\s*(🔧\s*)?Steps?:?.*$/gmi, "")
@@ -454,14 +500,23 @@ Avoid generic upsells; keep answers specific and helpful.`;
     let reply = r?.choices?.[0]?.message?.content
       || (isGreetingOrSmallTalk(message) ? "• Hi! How can I help today?" : "• Tell me what you’re working on and I’ll jump in.");
 
-    // Build items (brands/products prioritized; categories last)
+    // Build items (PRODUCTS FIRST -> brands -> categories)
     const items = buildQueryItems({ userMsg: message, modelReply: reply, vehicle, max: 8 });
 
-    // Inline affiliate links ONLY for brand/prod (not categories)
+    // Inline affiliate links: try exact URL from map, else Amazon search
     const linkTargets = items
-      .filter(it => it.kind === "brand" || it.kind === "prod")
-      .map(it => ({ name: it.display, url: buildAmazonSearchURL(it.query, { marketplace }) }));
-    if (linkTargets.length) reply = injectAffiliateLinks(reply, linkTargets);
+      .filter(it => it.kind === "prod" || it.kind === "brand")
+      .map(it => {
+        const fromMap = lookupAffiliate(it.display);
+        const url = fromMap
+          ? fromMap
+          : buildAmazonSearchURL(it.query, { marketplace });
+        return { name: it.display, url };
+      });
+
+    if (linkTargets.length) {
+      reply = injectAffiliateLinks(reply, linkTargets);
+    }
 
     // Final formatting: bullets only, NO TL;DR
     let styled = bulletize(reply);
